@@ -1,25 +1,25 @@
-//! Strands CLI — Interactive REPL for Strands Agents
+//! Strands CLI — Interactive TUI for Strands Agents
 //!
-//! A minimal, streaming CLI that wires core coding tools (shell, file read/write/edit,
-//! glob, grep, think) to a configurable model provider (Anthropic or Bedrock).
+//! A Claude Code-inspired fullscreen TUI that wires core coding tools (shell,
+//! file read/write/edit, glob, grep, think) to a configurable model provider.
 
-use std::io::{self, Write as _};
 use std::sync::Arc;
 
 use clap::Parser;
 use colored::Colorize;
-use futures::StreamExt;
 use serde_json::json;
 
-// Streaming event types (used via string matching for flexibility)
-use strands::types::tools::{AgentTool, ToolResult, ToolUse};
 use strands::tools::FunctionTool;
+use strands::types::tools::{AgentTool, ToolResult, ToolUse};
 use strands::{Agent, Result};
 
 // Tools from strands-tools
-use strands_tools::{FileReadTool, FileWriteTool, FileEditTool, GlobTool, GrepTool};
 use strands_tools::advanced::ThinkTool;
 use strands_tools::system::ShellTool;
+use strands_tools::{FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool};
+
+mod repl;
+mod tui;
 
 // ---------------------------------------------------------------------------
 // CLI arguments
@@ -44,9 +44,13 @@ struct Cli {
     #[arg(long, default_value = "30")]
     max_iterations: usize,
 
-    /// Run a single prompt (non-interactive)
+    /// Run a single prompt (non-interactive, plain output)
     #[arg(long = "prompt")]
     oneshot: Option<String>,
+
+    /// Disable fullscreen TUI, use plain-text REPL instead
+    #[arg(long = "no-tui")]
+    no_tui: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +61,14 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let model_name = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| match cli.provider.as_str() {
+            "bedrock" => "bedrock/default".to_string(),
+            _ => "claude-sonnet-4-20250514".to_string(),
+        });
+
     // Build model
     let model = build_model(&cli).await?;
 
@@ -64,7 +76,10 @@ async fn main() -> Result<()> {
     let tools = build_tools();
 
     // System prompt
-    let system_prompt = cli.system.clone().unwrap_or_else(|| build_system_prompt(&tools));
+    let system_prompt = cli
+        .system
+        .clone()
+        .unwrap_or_else(|| build_system_prompt(&tools));
 
     // Build agent
     let agent = Agent::builder()
@@ -76,11 +91,13 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    // One-shot or REPL
+    // Dispatch
     if let Some(prompt) = &cli.oneshot {
-        run_single_turn(&agent, prompt).await?;
+        repl::run_single_turn(&agent, prompt).await?;
+    } else if cli.no_tui {
+        repl::run_repl(&agent).await?;
     } else {
-        run_repl(&agent).await?;
+        tui::run(agent, model_name).await?;
     }
 
     Ok(())
@@ -95,7 +112,9 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
         "anthropic" => {
             use strands::models::anthropic::{AnthropicConfig, AnthropicModel};
 
-            let model_id = cli.model.clone()
+            let model_id = cli
+                .model
+                .clone()
                 .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
             let config = AnthropicConfig {
@@ -105,17 +124,12 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
             };
 
             let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
-            let model = AnthropicModel::new(
-                Some(model_id),
-                api_key,
-                None,
-                config,
-            ).await?;
+            let model = AnthropicModel::new(Some(model_id), api_key, None, config).await?;
 
             Ok(Arc::new(model))
         }
         "bedrock" => {
-            use strands::models::bedrock::{BedrockModel, BedrockConfig};
+            use strands::models::bedrock::{BedrockConfig, BedrockModel};
 
             let mut config = BedrockConfig::default();
             if let Some(ref model_id) = cli.model {
@@ -128,7 +142,11 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
             Ok(Arc::new(model))
         }
         other => {
-            eprintln!("{} Unknown provider '{}'. Use 'anthropic' or 'bedrock'.", "error:".red().bold(), other);
+            eprintln!(
+                "{} Unknown provider '{}'. Use 'anthropic' or 'bedrock'.",
+                "error:".red().bold(),
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -155,7 +173,12 @@ fn build_tools() -> Vec<Arc<dyn AgentTool>> {
             }
         },
         "required": ["command"]
-    }).as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    })
+    .as_object()
+    .unwrap()
+    .iter()
+    .map(|(k, v)| (k.clone(), v.clone()))
+    .collect();
 
     tools.push(Arc::new(FunctionTool::new(
         "Bash",
@@ -181,10 +204,15 @@ fn build_tools() -> Vec<Arc<dyn AgentTool>> {
 }
 
 fn bash_execute(tool_use: &ToolUse) -> Result<ToolResult> {
-    let command = tool_use.input.get("command").and_then(|v| v.as_str())
+    let command = tool_use
+        .input
+        .get("command")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| strands::Error::ToolExecution("Missing 'command' parameter".into()))?;
 
-    let _timeout_secs = tool_use.input.get("timeout")
+    let _timeout_secs = tool_use
+        .input
+        .get("timeout")
         .and_then(|v| v.as_u64())
         .unwrap_or(120)
         .min(600);
@@ -200,14 +228,26 @@ fn bash_execute(tool_use: &ToolUse) -> Result<ToolResult> {
 
     // Redirect to dedicated tools
     let redirects: &[(&[&str], &str)] = &[
-        (&["grep ", "rg "],          "Use the Grep tool instead of grep/rg via Bash."),
-        (&["cat ", "head ", "tail "], "Use the Read tool instead of cat/head/tail via Bash."),
-        (&["find "],                  "Use the Glob tool instead of find via Bash."),
-        (&["sed ", "awk "],           "Use the Edit tool instead of sed/awk via Bash."),
+        (
+            &["grep ", "rg "],
+            "Use the Grep tool instead of grep/rg via Bash.",
+        ),
+        (
+            &["cat ", "head ", "tail "],
+            "Use the Read tool instead of cat/head/tail via Bash.",
+        ),
+        (&["find "], "Use the Glob tool instead of find via Bash."),
+        (
+            &["sed ", "awk "],
+            "Use the Edit tool instead of sed/awk via Bash.",
+        ),
     ];
     for (patterns, msg) in redirects {
         if patterns.iter().any(|p| command.starts_with(p)) {
-            return Ok(ToolResult::error(tool_use.tool_use_id.clone(), msg.to_string()));
+            return Ok(ToolResult::error(
+                tool_use.tool_use_id.clone(),
+                msg.to_string(),
+            ));
         }
     }
 
@@ -221,19 +261,25 @@ fn bash_execute(tool_use: &ToolUse) -> Result<ToolResult> {
             let mut result = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.is_empty() {
-                if !result.is_empty() { result.push('\n'); }
+                if !result.is_empty() {
+                    result.push('\n');
+                }
                 result.push_str("stderr:\n");
                 result.push_str(&stderr);
             }
             if !output.status.success() {
-                result.push_str(&format!("\nExit code: {}", output.status.code().unwrap_or(-1)));
+                result.push_str(&format!(
+                    "\nExit code: {}",
+                    output.status.code().unwrap_or(-1)
+                ));
             }
-            // Truncate large output
             if result.len() > 30_000 {
                 result.truncate(30_000);
                 result.push_str("\n... (output truncated at 30KB)");
             }
-            if result.is_empty() { result = "(no output)".into(); }
+            if result.is_empty() {
+                result = "(no output)".into();
+            }
             Ok(ToolResult::success(tool_use.tool_use_id.clone(), result))
         }
         Err(e) => Ok(ToolResult::error(
@@ -254,7 +300,7 @@ fn build_system_prompt(tools: &[Arc<dyn AgentTool>]) -> String {
         .unwrap_or_else(|_| ".".into());
 
     format!(
-r#"You are an expert software engineer working as an interactive coding assistant.
+        r#"You are an expert software engineer working as an interactive coding assistant.
 
 # Tools
 Available tools: {tools}
@@ -282,183 +328,4 @@ Use the dedicated tool for each operation:
         cwd = cwd,
         platform = std::env::consts::OS,
     )
-}
-
-// ---------------------------------------------------------------------------
-// REPL
-// ---------------------------------------------------------------------------
-
-async fn run_repl(agent: &Agent) -> Result<()> {
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".into());
-
-    println!("{}", "Strands CLI".bold());
-    println!("  cwd: {}", cwd.dimmed());
-    println!("  Type {} to quit, {} to clear history\n",
-        "/exit".yellow(), "/clear".yellow());
-
-    let stdin = io::stdin();
-    loop {
-        // Prompt
-        print!("{} ", ">".cyan().bold());
-        io::stdout().flush().unwrap();
-
-        // Read input
-        let mut line = String::new();
-        if stdin.read_line(&mut line).unwrap() == 0 {
-            break; // EOF
-        }
-        let input = line.trim();
-        if input.is_empty() { continue; }
-
-        // Commands
-        match input {
-            "/exit" | "/quit" => break,
-            "/clear" => {
-                agent.clear_history();
-                println!("{}", "Conversation cleared.".dimmed());
-                continue;
-            }
-            _ => {}
-        }
-
-        // Stream response
-        if let Err(e) = stream_turn(agent, input).await {
-            eprintln!("\n{} {}", "error:".red().bold(), e);
-        }
-        println!(); // blank line between turns
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Streaming a single turn
-// ---------------------------------------------------------------------------
-
-async fn run_single_turn(agent: &Agent, prompt: &str) -> Result<()> {
-    stream_turn(agent, prompt).await
-}
-
-async fn stream_turn(agent: &Agent, prompt: &str) -> Result<()> {
-    let mut stream = agent.stream_async(prompt).await?;
-    let mut in_text = false;
-
-    while let Some(event) = stream.next().await {
-        let ev = event?;
-        let event_type_str = ev.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
-
-        match event_type_str {
-            // Text streaming
-            "content_block_delta" => {
-                if let Some(text) = ev.pointer("/delta/text").and_then(|v| v.as_str()) {
-                    if !in_text {
-                        in_text = true;
-                    }
-                    print!("{}", text);
-                    io::stdout().flush().unwrap();
-                }
-            }
-
-            // Tool call start
-            "content_block_start" => {
-                if let Some(name) = ev.pointer("/content_block/name").and_then(|v| v.as_str()) {
-                    if in_text {
-                        println!();
-                        in_text = false;
-                    }
-                    print!("{}", format!("  {} {}", "tool:".dimmed(), name.yellow()));
-                    io::stdout().flush().unwrap();
-                }
-            }
-
-            // Tool call with input
-            "tool_call" => {
-                let name = ev.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let input = &ev["input"];
-
-                // Show a compact summary of the tool call
-                let summary = tool_call_summary(name, input);
-                println!(" {}", summary.dimmed());
-            }
-
-            // Tool result
-            "tool_result" => {
-                let status = ev.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                let content = ev.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let preview = if content.len() > 200 {
-                    format!("{}...", &content[..200])
-                } else {
-                    content.to_string()
-                };
-                let color = if status == "success" { "32" } else { "31" };
-                let first_line = preview.lines().next().unwrap_or("");
-                println!("  \x1b[{}m{} {}\x1b[0m", color, "result:".to_string(), first_line);
-            }
-
-            // End of message
-            "message_stop" => {
-                if in_text {
-                    println!();
-                }
-                break;
-            }
-
-            // Data field (simple streaming)
-            _ => {
-                if let Some(data) = ev.get("data").and_then(|d| d.as_str()) {
-                    if !data.is_empty() {
-                        if !in_text { in_text = true; }
-                        print!("{}", data);
-                        io::stdout().flush().unwrap();
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Produce a short one-line summary of a tool call for display.
-fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
-    match name {
-        "Bash" | "Shell" => {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("?");
-            let display = if cmd.len() > 80 { format!("{}...", &cmd[..80]) } else { cmd.to_string() };
-            format!("$ {}", display)
-        }
-        "Read" => {
-            let path = input.get("file_path").or(input.get("path"))
-                .and_then(|v| v.as_str()).unwrap_or("?");
-            format!("{}", path)
-        }
-        "Write" => {
-            let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("{}", path)
-        }
-        "Edit" => {
-            let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("{}", path)
-        }
-        "Glob" => {
-            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("{}", pattern)
-        }
-        "Grep" => {
-            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
-            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            format!("/{}/  in {}", pattern, path)
-        }
-        "Think" => {
-            let thought = input.get("thought").and_then(|v| v.as_str()).unwrap_or("");
-            let preview = if thought.len() > 60 { format!("{}...", &thought[..60]) } else { thought.to_string() };
-            format!("\"{}\"", preview)
-        }
-        _ => {
-            let s = input.to_string();
-            if s.len() > 80 { format!("{}...", &s[..80]) } else { s }
-        }
-    }
 }
