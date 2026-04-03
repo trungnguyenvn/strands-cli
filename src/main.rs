@@ -3,13 +3,16 @@
 //! A Claude Code-inspired fullscreen TUI that wires core coding tools (shell,
 //! file read/write/edit, glob, grep, think) to a configurable model provider.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use colored::Colorize;
 use serde_json::json;
 
+use strands::agent::state::AgentState;
 use strands::tools::FunctionTool;
+use strands::types::content::Message;
 use strands::types::tools::{AgentTool, ToolResult, ToolUse};
 use strands::{Agent, Result};
 
@@ -18,6 +21,9 @@ use strands_tools::advanced::ThinkTool;
 use strands_tools::system::ShellTool;
 use strands_tools::{FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool};
 
+mod commands;
+mod context;
+mod prompt;
 mod repl;
 mod tui;
 
@@ -75,21 +81,52 @@ async fn main() -> Result<()> {
     // Build tools
     let tools = build_tools();
 
-    // System prompt
-    let system_prompt = cli
-        .system
-        .clone()
-        .unwrap_or_else(|| build_system_prompt(&tools));
+    // Gather context
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let git_ctx = context::get_git_status(&cwd);
+    let user_ctx = context::get_user_context(&cwd);
+
+    // Build system prompt
+    let tool_names: Vec<String> = tools.iter().map(|t| t.tool_name().to_string()).collect();
+    let cwd_str = cwd.display().to_string();
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let render_ctx = prompt::RenderContext {
+        tool_names: &tool_names,
+        cwd: &cwd_str,
+        platform: std::env::consts::OS,
+        shell: "bash",
+        git: git_ctx.as_ref(),
+        date: &date,
+        has_user_context: user_ctx.is_some(),
+    };
+    let source = match cli.system.clone() {
+        Some(s) => prompt::PromptSource::Override(s),
+        None => prompt::PromptSource::Default,
+    };
+    let system_prompt = prompt::build_effective_system_prompt(source, &render_ctx);
 
     // Build agent
-    let agent = Agent::builder()
+    let mut builder = Agent::builder()
         .with_model(model)
         .with_system_prompt(system_prompt)
         .with_tools(tools)
         .with_max_iterations(cli.max_iterations)
-        .with_sliding_window(500)
-        .build()
-        .await?;
+        .with_sliding_window(500);
+
+    // Inject STRANDS.md as initial conversation context
+    if let Some(ref user_ctx) = user_ctx {
+        let mut state = AgentState::new();
+        state.add_message(Message::user(format!(
+            "<context>\n{}\n</context>",
+            user_ctx.content
+        )));
+        state.add_message(Message::assistant(
+            "I've read the project context. Ready to help.",
+        ));
+        builder = builder.with_conversation_state(state);
+    }
+
+    let agent = builder.build().await?;
 
     // Dispatch
     if let Some(prompt) = &cli.oneshot {
@@ -289,44 +326,3 @@ fn bash_execute(tool_use: &ToolUse) -> Result<ToolResult> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// System prompt
-// ---------------------------------------------------------------------------
-
-fn build_system_prompt(tools: &[Arc<dyn AgentTool>]) -> String {
-    let tool_names: Vec<String> = tools.iter().map(|t| t.tool_name().to_string()).collect();
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".into());
-
-    format!(
-        r#"You are an expert software engineer working as an interactive coding assistant.
-
-# Tools
-Available tools: {tools}
-
-Use the dedicated tool for each operation:
-- Read files: Read (not cat/head/tail via Bash)
-- Edit files: Edit (not sed/awk via Bash)
-- Write files: Write (not echo/heredoc via Bash)
-- Search file contents: Grep (not grep/rg via Bash)
-- Find files by pattern: Glob (not find/ls via Bash)
-- Run shell commands: Bash (only for commands without a dedicated tool)
-- Structured reasoning: Think (use for complex multi-step reasoning)
-
-# Guidelines
-- ALWAYS Read a file before using Write or Edit on it. The Write and Edit tools will reject changes to files you haven't read first.
-- Be concise. Lead with the answer, not the reasoning.
-- When editing, prefer small targeted changes over full rewrites.
-- Use absolute paths based on the working directory.
-- If a tool call fails, read the error message and adjust your approach — don't retry the same call.
-
-# Environment
-- Working directory: {cwd}
-- Platform: {platform}
-- Shell: bash"#,
-        tools = tool_names.join(", "),
-        cwd = cwd,
-        platform = std::env::consts::OS,
-    )
-}

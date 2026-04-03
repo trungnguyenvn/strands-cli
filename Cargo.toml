@@ -37,3 +37,4 @@ syntect = { version = "5", default-features = false, features = ["default-syntax
 
 # Misc
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
