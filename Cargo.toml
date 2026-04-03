@@ -33,6 +33,7 @@ tui-textarea = { version = "0.7", features = ["crossterm"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 pulldown-cmark = "0.12"
 unicode-width = "0.2"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
 
 # Misc
 async-trait = "0.1"

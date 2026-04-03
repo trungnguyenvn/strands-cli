@@ -1,4 +1,4 @@
-//! Status bar widget — model name, status, key hints.
+//! Status bar widget — model name, status, turn count, scroll position, key hints.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -40,35 +40,50 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         }
     };
 
-    let msg_count = state.messages.len();
-    let msg_info = Span::styled(
-        format!(" {} msgs", msg_count / 2), // user+assistant pairs
+    let turn_info = Span::styled(
+        format!(" {} turns ", state.turn_count),
         Style::default().fg(Color::DarkGray),
     );
 
+    let scroll_info = if state.auto_scroll || state.total_lines == 0 {
+        Span::styled(" \u{2193} bottom ", Style::default().fg(Color::DarkGray))
+    } else {
+        let pct = 100u16.saturating_sub(
+            (state.scroll_offset as u32 * 100 / state.total_lines.max(1) as u32) as u16,
+        )
+        .min(100);
+        Span::styled(
+            format!(" \u{2191} {}% ", pct),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+
     let key_hints = match &state.agent_status {
-        AgentStatus::Streaming => {
-            Span::styled(" esc stop ", Style::default().fg(Color::DarkGray))
-        }
+        AgentStatus::Streaming => Span::styled(
+            " Ctrl+C/Esc cancel ",
+            Style::default().fg(Color::DarkGray),
+        ),
         _ => Span::styled(
-            " pgup/pgdn scroll │ /clear │ /exit ",
+            " pgup/pgdn scroll \u{2502} /clear \u{2502} /exit ",
             Style::default().fg(Color::DarkGray),
         ),
     };
 
-    let separator = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
+    let sep = Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray));
 
     let line = Line::from(vec![
         Span::styled(
             format!(" {} ", state.model_name),
             Style::default().fg(Color::DarkGray),
         ),
-        separator.clone(),
+        sep.clone(),
         spinner,
         status_text,
-        separator.clone(),
-        msg_info,
-        separator,
+        sep.clone(),
+        turn_info,
+        sep.clone(),
+        scroll_info,
+        sep,
         key_hints,
     ]);
 

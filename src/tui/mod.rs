@@ -62,8 +62,13 @@ pub async fn run(agent: Agent, model_name: String) -> strands::Result<()> {
                     }
                 }
             }
-            Event::Resize(_, _) => {
-                // Ratatui handles resize on next draw automatically
+            Event::Resize(w, _) => {
+                app.state.terminal_width = w;
+                app.state.total_lines = 0; // force recompute on next render
+            }
+            // Mouse events
+            Event::Mouse(mouse_event) => {
+                handle_mouse(&mut app, mouse_event);
             }
             // Agent events
             Event::AgentTextDelta(_)
@@ -86,26 +91,52 @@ pub async fn run(agent: Agent, model_name: String) -> strands::Result<()> {
     Ok(())
 }
 
+fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
+    use crossterm::event::MouseEventKind;
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.state.auto_scroll = false;
+            app.state.scroll_offset = app.state.scroll_offset.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            if app.state.scroll_offset <= 3 {
+                app.state.scroll_offset = 0;
+                app.state.auto_scroll = true;
+            } else {
+                app.state.scroll_offset = app.state.scroll_offset.saturating_sub(3);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_key(
     app: &mut TuiApp,
     key: crossterm::event::KeyEvent,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
 ) {
     match (key.modifiers, key.code) {
-        // Quit
+        // Quit or cancel streaming
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             if matches!(app.state.agent_status, AgentStatus::Streaming) {
-                // TODO: cancel the streaming task
+                if let Some(ref a) = app.state.cancel_agent {
+                    a.cancel();
+                }
                 app.state.agent_status = AgentStatus::Idle;
+                app.state.cancel_agent = None;
             } else {
                 app.state.should_quit = true;
             }
         }
 
-        // Escape — cancel streaming or clear input
+        // Escape — cancel streaming
         (KeyModifiers::NONE, KeyCode::Esc) => {
             if matches!(app.state.agent_status, AgentStatus::Streaming) {
+                if let Some(ref a) = app.state.cancel_agent {
+                    a.cancel();
+                }
                 app.state.agent_status = AgentStatus::Idle;
+                app.state.cancel_agent = None;
             }
         }
 

@@ -4922,6 +4922,7 @@ dependencies = [
  "serde_json",
  "strands-agents",
  "strands-tools",
+ "syntect",
  "tokio",
  "tokio-util",
  "tui-textarea",

@@ -51,6 +51,34 @@ pub fn render_tool_call(
     Line::from(spans)
 }
 
+/// Render a collapsed group of successful tool calls as a single line.
+pub fn render_tool_call_group(calls: &[(&str, &str)]) -> Line<'static> {
+    let count = calls.len();
+    let summary = if count <= 3 {
+        calls
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        format!(
+            "{}, {} and {} more",
+            calls[0].0,
+            calls[1].0,
+            count - 2
+        )
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "\u{2714}",
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" "),
+        Span::styled(summary, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
 fn tool_name_color(name: &str) -> Color {
     match name {
         "Read" | "Write" | "Edit" | "NotebookEdit" => Color::Yellow,

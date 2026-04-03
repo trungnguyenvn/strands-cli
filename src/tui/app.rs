@@ -25,7 +25,16 @@ pub enum ContentBlock {
         name: String,
         summary: String,
         status: ToolCallStatus,
+        group_key: Option<&'static str>,
     },
+}
+
+fn tool_group_key(name: &str) -> Option<&'static str> {
+    match name {
+        "Read" | "Glob" | "Grep" | "WebFetch" | "WebSearch" => Some("search"),
+        "Write" | "Edit" | "NotebookEdit" => Some("write"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,10 +80,12 @@ impl ChatMessage {
     }
 
     pub fn add_tool_call(&mut self, name: String, summary: String, status: ToolCallStatus) {
+        let group_key = tool_group_key(&name);
         self.blocks.push(ContentBlock::ToolCall {
             name,
             summary,
             status,
+            group_key,
         });
     }
 
@@ -97,7 +108,14 @@ pub struct AppState {
     pub tick_count: usize,
     pub model_name: String,
     pub should_quit: bool,
-    pub total_lines: u16, // cached for scroll math
+    pub total_lines: u16,
+    pub terminal_width: u16,
+    pub turn_count: usize,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_stash: String,
+    /// Clone of the agent used to cancel a streaming task.
+    pub cancel_agent: Option<Agent>,
 }
 
 impl AppState {
@@ -105,6 +123,7 @@ impl AppState {
         let mut input = tui_textarea::TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
         input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
+        let terminal_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
         Self {
             messages: Vec::new(),
             scroll_offset: 0,
@@ -115,6 +134,12 @@ impl AppState {
             model_name,
             should_quit: false,
             total_lines: 0,
+            terminal_width,
+            turn_count: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            history_stash: String::new(),
+            cancel_agent: None,
         }
     }
 }
@@ -160,6 +185,17 @@ impl TuiApp {
             return;
         }
 
+        // Save to input history (deduplicated)
+        let trimmed = prompt.trim().to_string();
+        if !trimmed.starts_with('/') {
+            if self.state.input_history.last().map(|s| s.as_str()) != Some(trimmed.as_str()) {
+                self.state.input_history.push(trimmed);
+            }
+        }
+        self.state.history_index = None;
+        self.state.history_stash.clear();
+        self.state.turn_count += 1;
+
         // Add user message
         self.state.messages.push(ChatMessage::user(prompt.clone()));
         self.state.messages.push(ChatMessage::assistant_empty());
@@ -171,6 +207,10 @@ impl TuiApp {
         self.state.input = tui_textarea::TextArea::default();
         self.state.input.set_cursor_line_style(ratatui::style::Style::default());
         self.state.input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
+
+        // Reset cancel signal and store agent clone for cancellation
+        self.agent.reset_cancel();
+        self.state.cancel_agent = Some(self.agent.clone());
 
         // Spawn agent streaming task
         let agent = self.agent.clone();
@@ -191,14 +231,9 @@ impl TuiApp {
                                             .and_then(|v| v.as_str())
                                             .map(|t| Event::AgentTextDelta(t.to_string()))
                                     }
-                                    "content_block_start" => {
-                                        ev.pointer("/content_block/name")
-                                            .and_then(|v| v.as_str())
-                                            .map(|n| Event::AgentToolStart {
-                                                name: n.to_string(),
-                                            })
-                                    }
                                     "tool_call" => {
+                                        // tool_call carries the tool name — emit
+                                        // ToolStart first, then ToolCall with input
                                         let name = ev
                                             .get("name")
                                             .and_then(|v| v.as_str())
@@ -208,27 +243,43 @@ impl TuiApp {
                                             .get("input")
                                             .cloned()
                                             .unwrap_or(serde_json::Value::Null);
+                                        // Send ToolStart before ToolCall
+                                        let _ = event_tx.send(Event::AgentToolStart {
+                                            name: name.clone(),
+                                        });
                                         Some(Event::AgentToolCall { name, input })
                                     }
                                     "tool_result" => {
-                                        let status = ev
-                                            .get("status")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?")
-                                            .to_string();
+                                        // Two formats: Anthropic (status + result_summary)
+                                        // and Bedrock (is_error + content)
+                                        let status = if let Some(s) = ev.get("status").and_then(|v| v.as_str()) {
+                                            s.to_string()
+                                        } else if ev.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                            "error".to_string()
+                                        } else {
+                                            "success".to_string()
+                                        };
                                         let content = ev
-                                            .get("content")
+                                            .get("result_summary")
+                                            .or_else(|| ev.get("content"))
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
                                             .to_string();
                                         Some(Event::AgentToolResult { status, content })
                                     }
-                                    "message_stop" => Some(Event::AgentDone),
+                                    "message_stop" | "stream_complete" => {
+                                        Some(Event::AgentDone)
+                                    }
+                                    // Ignore known non-content events
+                                    "content_block_start" | "content_block_stop"
+                                    | "message_start" | "tool_execution_start"
+                                    | "tool_execution_progress"
+                                    | "tool_execution_complete" => None,
                                     _ => {
                                         // Handle simple "data" field streaming
                                         ev.get("data")
                                             .and_then(|d| d.as_str())
-                                            .filter(|s| !s.is_empty())
+                                            .filter(|s| !s.is_empty() && s != &"complete")
                                             .map(|t| Event::AgentTextDelta(t.to_string()))
                                     }
                                 };
@@ -287,18 +338,32 @@ impl TuiApp {
                     }
                 }
             }
-            Event::AgentToolResult { status, .. } => {
+            Event::AgentToolResult { status, content } => {
                 if let Some(msg) = last_msg {
                     let new_status = if status == "success" {
                         ToolCallStatus::Success
                     } else {
                         ToolCallStatus::Error
                     };
+                    // For errors, show the error reason in the summary
+                    if new_status == ToolCallStatus::Error && !content.is_empty() {
+                        for block in msg.blocks.iter_mut().rev() {
+                            if let ContentBlock::ToolCall {
+                                summary: ref mut s, ..
+                            } = block
+                            {
+                                *s = content.clone();
+                                break;
+                            }
+                        }
+                    }
                     msg.set_last_tool_status(new_status);
                 }
             }
             Event::AgentDone => {
                 self.state.agent_status = AgentStatus::Idle;
+                self.state.cancel_agent = None;
+                self.agent.reset_cancel();
             }
             Event::AgentError(e) => {
                 self.state.agent_status = AgentStatus::Error(e.clone());
