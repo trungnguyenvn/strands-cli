@@ -1,0 +1,30 @@
+[package]
+name = "strands-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive CLI for Strands Agents"
+
+[[bin]]
+name = "strands"
+path = "src/main.rs"
+
+[dependencies]
+# Strands SDK and tools
+strands-agents = { path = "../sdk-rust", features = ["anthropic"] }
+strands-tools = { path = "../tools-rust", features = ["file-tools", "system-tools", "advanced-tools"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde_json = "1"
+
+# Terminal colors
+colored = "2"
+
+# For flush
+async-trait = "0.1"
