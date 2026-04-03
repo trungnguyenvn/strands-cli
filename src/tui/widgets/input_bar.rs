@@ -6,6 +6,10 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Block;
 use ratatui::Frame;
 
+use ratatui::text::Span;
+use ratatui::widgets::Paragraph;
+
+use crate::commands;
 use crate::tui::app::{AgentStatus, AppState};
 
 /// Returns the desired height for the input area (min 3, max 40% of terminal).
@@ -35,6 +39,70 @@ pub fn render_input(state: &mut AppState, frame: &mut Frame, area: Rect) {
 
     state.input.set_block(block);
     frame.render_widget(&state.input, area);
+
+    // Render inline argument hint (mirrors Claude Code's BaseTextInput argumentHint).
+    // Shows dimmed hint text after the command name when the user has typed
+    // "/command " (command + single trailing space, no real args yet).
+    render_argument_hint(state, frame, area);
+}
+
+/// Render a dimmed argument hint inline after the cursor when typing a slash command.
+/// Mirrors Claude Code's `showArgumentHint` in `BaseTextInput.tsx`.
+fn render_argument_hint(state: &AppState, frame: &mut Frame, area: Rect) {
+    let text = state.input.lines().join("\n");
+    let trimmed = text.trim_start();
+
+    if !trimmed.starts_with('/') {
+        return;
+    }
+
+    // Only show hint when: "/command " with trailing space but no real args yet.
+    // This matches Claude Code: `commandWithoutArgs && props.value.startsWith("/")`
+    let has_trailing_space = text.ends_with(' ');
+    let has_real_args = {
+        let space_idx = trimmed.find(' ');
+        space_idx
+            .map(|i| trimmed[i + 1..].trim().len() > 0)
+            .unwrap_or(false)
+    };
+
+    if !has_trailing_space || has_real_args {
+        return;
+    }
+
+    let parsed = match commands::parse_slash_command(trimmed) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let hint = match state.command_registry.find(&parsed.command_name) {
+        Some(cmd) => match cmd.argument_hint {
+            Some(h) => h,
+            None => return,
+        },
+        None => return,
+    };
+
+    // Position the hint after the input text, inside the bordered area.
+    // The border takes 1 col on each side, so inner x = area.x + 1.
+    // The cursor is at column (text.len()), clamped to the inner width.
+    let inner_x = area.x + 1;
+    let inner_width = area.width.saturating_sub(2);
+    let text_len = text.len() as u16;
+
+    if text_len >= inner_width {
+        return; // no room for hint
+    }
+
+    let hint_x = inner_x + text_len;
+    let hint_width = inner_width.saturating_sub(text_len);
+    let hint_area = Rect::new(hint_x, area.y + 1, hint_width, 1);
+
+    let hint_widget = Paragraph::new(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(hint_widget, hint_area);
 }
 
 /// Process a key event for the input bar. Returns true if the key was consumed.

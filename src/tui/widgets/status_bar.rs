@@ -64,7 +64,7 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
         _ => Span::styled(
-            " pgup/pgdn scroll \u{2502} /clear \u{2502} /exit ",
+            " pgup/pgdn scroll \u{2502} /help \u{2502} /clear \u{2502} /exit ",
             Style::default().fg(Color::DarkGray),
         ),
     };

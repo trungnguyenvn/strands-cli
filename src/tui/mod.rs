@@ -6,6 +6,9 @@ pub mod render;
 pub mod terminal;
 pub mod widgets;
 
+#[cfg(test)]
+mod tui_tests;
+
 use crossterm::event::{KeyCode, KeyModifiers};
 use strands::Agent;
 
@@ -129,9 +132,13 @@ fn handle_key(
             }
         }
 
-        // Escape — cancel streaming
+        // Escape — dismiss suggestions or cancel streaming
         (KeyModifiers::NONE, KeyCode::Esc) => {
-            if matches!(app.state.agent_status, AgentStatus::Streaming) {
+            if !app.state.suggestions.is_empty() {
+                // Dismiss autocomplete dropdown (mirrors Claude Code's autocomplete:dismiss)
+                app.state.suggestions.clear();
+                app.state.selected_suggestion = -1;
+            } else if matches!(app.state.agent_status, AgentStatus::Streaming) {
                 if let Some(ref a) = app.state.cancel_agent {
                     a.cancel();
                 }
@@ -168,14 +175,70 @@ fn handle_key(
             }
         }
 
-        // All other keys go to input bar (only when idle)
+        // Tab — accept autocomplete suggestion (mirrors Claude Code's autocomplete:accept)
+        (KeyModifiers::NONE, KeyCode::Tab) => {
+            if !app.state.suggestions.is_empty() {
+                app.accept_suggestion();
+                // Re-trigger suggestions for the new input (e.g., "/clear " → no suggestions)
+                app.update_suggestions();
+            }
+        }
+
+        // All other keys go to input bar.
+        // When streaming, only allow immediate slash commands (mirrors Claude Code's
+        // handlePromptSubmit fast-path for `immediate: true` local-jsx commands).
         _ => {
-            if matches!(app.state.agent_status, AgentStatus::Idle | AgentStatus::Error(_)) {
+            let is_idle = matches!(app.state.agent_status, AgentStatus::Idle | AgentStatus::Error(_));
+            let is_streaming = matches!(app.state.agent_status, AgentStatus::Streaming);
+            let has_suggestions = !app.state.suggestions.is_empty();
+
+            if is_idle || is_streaming {
+                // When suggestions are visible, intercept Up/Down for navigation
+                // (mirrors Claude Code's autocomplete:previous / autocomplete:next)
+                if has_suggestions {
+                    match key.code {
+                        KeyCode::Up => {
+                            let len = app.state.suggestions.len() as i32;
+                            app.state.selected_suggestion = if app.state.selected_suggestion <= 0 {
+                                len - 1 // wrap to bottom
+                            } else {
+                                app.state.selected_suggestion - 1
+                            };
+                            return;
+                        }
+                        KeyCode::Down => {
+                            let len = app.state.suggestions.len() as i32;
+                            app.state.selected_suggestion =
+                                if app.state.selected_suggestion >= len - 1 {
+                                    0 // wrap to top
+                                } else {
+                                    app.state.selected_suggestion + 1
+                                };
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 match input_bar::handle_input_key(&mut app.state, key) {
                     InputAction::Submit => {
-                        app.submit(event_tx);
+                        if has_suggestions && app.state.selected_suggestion >= 0 {
+                            // Enter with suggestions visible: accept and submit if no args needed
+                            // (mirrors Claude Code's handleEnter → applyCommandSuggestion with shouldExecute=true)
+                            app.accept_suggestion();
+                            app.submit(event_tx);
+                        } else if is_idle {
+                            app.submit(event_tx);
+                        } else if is_streaming {
+                            app.try_immediate_command();
+                        }
                     }
-                    InputAction::Consumed => {}
+                    InputAction::Consumed => {
+                        // After every keystroke, update suggestions
+                        if is_idle {
+                            app.update_suggestions();
+                        }
+                    }
                 }
             }
         }

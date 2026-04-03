@@ -9,6 +9,10 @@ use futures::StreamExt;
 
 use strands::Agent;
 
+use crate::commands::{
+    self, builtin_registry, CommandContext, CommandResult, DispatchResult,
+};
+
 pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -17,12 +21,17 @@ pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
     println!("{}", "Strands CLI".bold());
     println!("  cwd: {}", cwd.dimmed());
     println!(
-        "  Type {} to quit, {} to clear history\n",
+        "  Type {} for commands, {} to quit, {} to clear history\n",
+        "/help".yellow(),
         "/exit".yellow(),
         "/clear".yellow()
     );
 
+    let registry = builtin_registry();
     let stdin = io::stdin();
+    let mut turn_count: usize = 0;
+    let mut message_count: usize = 0;
+
     loop {
         print!("{} ", ">".cyan().bold());
         io::stdout().flush().unwrap();
@@ -36,16 +45,51 @@ pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
             continue;
         }
 
-        match input {
-            "/exit" | "/quit" => break,
-            "/clear" => {
-                agent.clear_history();
-                println!("{}", "Conversation cleared.".dimmed());
-                continue;
+        // Dispatch slash commands via registry
+        if input.starts_with('/') {
+            let ctx = CommandContext {
+                model_name: String::new(), // not available in plain REPL
+                turn_count,
+                message_count,
+            };
+            match commands::dispatch(input, &registry, &ctx) {
+                DispatchResult::Local(CommandResult::Quit) => break,
+                DispatchResult::Local(CommandResult::Clear) => {
+                    agent.clear_history();
+                    message_count = 0;
+                    println!("{}", "Conversation cleared.".dimmed());
+                    continue;
+                }
+                DispatchResult::Local(CommandResult::Text(text)) => {
+                    println!("{}", text);
+                    continue;
+                }
+                DispatchResult::Local(CommandResult::Skip) => continue,
+                DispatchResult::Prompt(expanded) => {
+                    turn_count += 1;
+                    message_count += 2;
+                    if let Err(e) = stream_turn(agent, &expanded).await {
+                        eprintln!("\n{} {}", "error:".red().bold(), e);
+                    }
+                    println!();
+                    continue;
+                }
+                DispatchResult::Unknown(name) => {
+                    eprintln!(
+                        "{} Unknown command: /{}. Type /help for available commands.",
+                        "error:".red().bold(),
+                        name
+                    );
+                    continue;
+                }
+                DispatchResult::NotACommand => {
+                    // Fall through — treat as normal input
+                }
             }
-            _ => {}
         }
 
+        turn_count += 1;
+        message_count += 2;
         if let Err(e) = stream_turn(agent, input).await {
             eprintln!("\n{} {}", "error:".red().bold(), e);
         }
