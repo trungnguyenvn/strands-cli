@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
                     let content = std::fs::read_to_string(p).ok()?;
                     let source_type = if home_strands
                         .as_ref()
-                        .map_or(false, |hs| p.starts_with(hs))
+                        .is_some_and(|hs| p.starts_with(hs))
                     {
                         "global"
                     } else {
@@ -369,9 +369,11 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
 
             let model_id = cli.model.clone()
                 .unwrap_or_else(|| "us.anthropic.claude-sonnet-4-6".to_string());
-            let mut config = BedrockConfig::default();
-            config.model_id = model_id;
-            config.max_tokens = Some(max_tokens);
+            let config = BedrockConfig {
+                model_id,
+                max_tokens: Some(max_tokens),
+                ..BedrockConfig::default()
+            };
 
             let model = BedrockModel::new(None, None, Some("us-east-1".to_string()), config).await?;
 
@@ -517,9 +519,11 @@ async fn build_anthropic_model(model_id: &str) -> Result<Arc<dyn strands::types:
 
 async fn build_bedrock_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
     use strands::models::bedrock::{BedrockConfig, BedrockModel};
-    let mut config = BedrockConfig::default();
-    config.model_id = model_id.to_string();
-    config.max_tokens = Some(runtime_max_tokens());
+    let config = BedrockConfig {
+        model_id: model_id.to_string(),
+        max_tokens: Some(runtime_max_tokens()),
+        ..BedrockConfig::default()
+    };
     let model = BedrockModel::new(None, None, Some("us-east-1".to_string()), config).await?;
     Ok(Arc::new(model))
 }

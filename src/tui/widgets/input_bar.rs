@@ -136,8 +136,7 @@ fn render_argument_hint(state: &AppState, frame: &mut Frame, area: Rect, prompt_
     let has_real_args = {
         let space_idx = trimmed.find(' ');
         space_idx
-            .map(|i| trimmed[i + 1..].trim().len() > 0)
-            .unwrap_or(false)
+            .is_some_and(|i| !trimmed[i + 1..].trim().is_empty())
     };
 
     if !has_trailing_space || has_real_args {

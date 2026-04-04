@@ -159,7 +159,7 @@ fn render_code_block(code: &str, lang: &str, max_width: u16) -> Vec<Line<'static
     // Adaptive box width based on content
     let max_code_width = code
         .lines()
-        .map(|l| UnicodeWidthStr::width(l))
+        .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
     let available = (max_width as usize).saturating_sub(8); // margin for "  │ " prefix + padding
@@ -281,7 +281,7 @@ pub fn find_stable_boundary(text: &str) -> usize {
         if bytes[i] == b'\n'
             && i + 1 < len
             && bytes[i + 1] == b'\n'
-            && fence_count % 2 == 0
+            && fence_count.is_multiple_of(2)
         {
             boundary = i + 2; // after the \n\n
         }

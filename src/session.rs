@@ -80,6 +80,12 @@ impl SessionId {
     }
 }
 
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -131,7 +137,7 @@ pub fn list_sessions(sessions_dir: &Path) -> Vec<SessionSummary> {
         .filter(|e| {
             e.path()
                 .extension()
-                .map_or(false, |ext| ext == "jsonl")
+                .is_some_and(|ext| ext == "jsonl")
         })
         .filter_map(|e| {
             let path = e.path();
@@ -364,7 +370,7 @@ fn sanitize_messages_for_api(
     // continue from there. That's fine — it's a valid resume point. We only
     // strip if the conversation ends with assistant tool_uses but NO following
     // user tool_results (the session was killed mid-tool-execution).
-    if result.last().map_or(false, |m| {
+    if result.last().is_some_and(|m| {
         m.role == Role::Assistant
             && m.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
     }) {

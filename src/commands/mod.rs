@@ -162,6 +162,9 @@ impl CommandContext {
 // Command types
 // ---------------------------------------------------------------------------
 
+/// Type alias for the prompt-generating closure used by `CommandKind::Prompt`.
+pub type PromptFn = Box<dyn Fn(&str, &CommandContext) -> String + Send + Sync>;
+
 /// The kind of a slash command, mirroring Claude Code's `LocalCommand` / `PromptCommand`.
 pub enum CommandKind {
     /// Runs a local function. Does not query the model.
@@ -170,7 +173,7 @@ pub enum CommandKind {
     },
     /// Expands into a prompt that is sent to the model.
     Prompt {
-        get_prompt: Box<dyn Fn(&str, &CommandContext) -> String + Send + Sync>,
+        get_prompt: PromptFn,
     },
 }
 
@@ -229,14 +232,14 @@ impl CommandRegistry {
     pub fn visible(&self) -> impl Iterator<Item = &Command> {
         self.commands
             .iter()
-            .filter(|c| !c.is_hidden && c.is_enabled.map_or(true, |f| f()))
+            .filter(|c| !c.is_hidden && c.is_enabled.as_ref().is_none_or(|f| f()))
     }
 
     /// Check if a command is enabled (mirrors Claude Code's `isCommandEnabled`).
     #[allow(dead_code)]
     pub fn is_command_enabled(&self, name: &str) -> bool {
         self.find(name)
-            .map_or(false, |cmd| cmd.is_enabled.map_or(true, |f| f()))
+            .is_some_and(|cmd| cmd.is_enabled.as_ref().is_none_or(|f| f()))
     }
 
     /// Snapshot of all visible commands, for rendering `/help`.
@@ -288,7 +291,7 @@ pub fn dispatch(input: &str, registry: &CommandRegistry, context: &CommandContex
     };
 
     match registry.find(&parsed.command_name) {
-        Some(cmd) if cmd.is_enabled.map_or(true, |f| f()) => match &cmd.kind {
+        Some(cmd) if cmd.is_enabled.as_ref().is_none_or(|f| f()) => match &cmd.kind {
             CommandKind::Local { execute } => {
                 DispatchResult::Local(execute(&parsed.args, context))
             }
@@ -758,7 +761,7 @@ fn cmd_rename(args: &str, _ctx: &CommandContext) -> CommandResult {
 }
 
 fn cmd_status(_args: &str, ctx: &CommandContext) -> CommandResult {
-    let lines = vec![
+    let lines = [
         format!("Model: {}", ctx.model_name),
         format!("Turns: {}", ctx.turn_count),
         format!("Messages: {}", ctx.message_count),
@@ -1025,12 +1028,12 @@ struct AvailableProviders {
 }
 
 fn detect_available_providers() -> AvailableProviders {
-    let anthropic = std::env::var("ANTHROPIC_API_KEY").map_or(false, |v| !v.is_empty());
+    let anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty());
 
     // Bedrock: check AWS credentials (env vars, config file, or instance profile marker)
-    let bedrock = std::env::var("AWS_ACCESS_KEY_ID").map_or(false, |v| !v.is_empty())
-        || std::env::var("AWS_PROFILE").map_or(false, |v| !v.is_empty())
-        || std::env::var("AWS_ROLE_ARN").map_or(false, |v| !v.is_empty())
+    let bedrock = std::env::var("AWS_ACCESS_KEY_ID").is_ok_and(|v| !v.is_empty())
+        || std::env::var("AWS_PROFILE").is_ok_and(|v| !v.is_empty())
+        || std::env::var("AWS_ROLE_ARN").is_ok_and(|v| !v.is_empty())
         || std::path::Path::new(&format!(
             "{}/.aws/credentials",
             std::env::var("HOME").unwrap_or_default()
@@ -1042,12 +1045,12 @@ fn detect_available_providers() -> AvailableProviders {
         ))
         .exists();
 
-    let openai = std::env::var("OPENAI_API_KEY").map_or(false, |v| !v.is_empty());
+    let openai = std::env::var("OPENAI_API_KEY").is_ok_and(|v| !v.is_empty());
 
     // Ollama: always show (local, no key needed) if OLLAMA_BASE_URL is set or default port reachable
     let ollama = std::env::var("OLLAMA_BASE_URL").is_ok();
 
-    let mistral = std::env::var("MISTRAL_API_KEY").map_or(false, |v| !v.is_empty());
+    let mistral = std::env::var("MISTRAL_API_KEY").is_ok_and(|v| !v.is_empty());
 
     AvailableProviders { anthropic, bedrock, openai, ollama, mistral }
 }
@@ -1311,7 +1314,7 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_mod
     let mut matches: Vec<SuggestionItem> = registry
         .visible()
         .filter(|cmd| {
-            let enabled = cmd.is_enabled.map_or(true, |f| f());
+            let enabled = cmd.is_enabled.as_ref().is_none_or(|f| f());
             if !enabled {
                 return false;
             }
@@ -1432,10 +1435,10 @@ fn generate_session_suggestions(query: &str) -> Vec<SuggestionItem> {
             s.session_id.to_lowercase().contains(&q)
                 || s.display_title
                     .as_ref()
-                    .map_or(false, |t| t.to_lowercase().contains(&q))
+                    .is_some_and(|t| t.to_lowercase().contains(&q))
                 || s.git_branch
                     .as_ref()
-                    .map_or(false, |b| b.to_lowercase().contains(&q))
+                    .is_some_and(|b| b.to_lowercase().contains(&q))
         })
         .map(|s| {
             // Build description: "date · branch · sizeKB"

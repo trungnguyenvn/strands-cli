@@ -10,7 +10,7 @@
 /// Rough token count estimate: chars / 4.
 /// Matches the heuristic used by the Rust SDK's `ProactiveConversationManager`.
 fn estimate_tokens(text: &str) -> u64 {
-    (text.len() as u64 + 3) / 4
+    (text.len() as u64).div_ceil(4)
 }
 
 /// Estimate tokens for a JSON-serialized value (tool specs, messages, etc.).

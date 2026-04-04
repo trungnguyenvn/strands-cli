@@ -337,7 +337,7 @@ async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<bool> {
                         println!();
                         in_text = false;
                     }
-                    print!("{}", format!("  {} {}", "tool:".dimmed(), name.yellow()));
+                    print!("  {} {}", "tool:".dimmed(), name.yellow());
                     io::stdout().flush().unwrap();
                 }
             }
@@ -358,7 +358,7 @@ async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<bool> {
                 };
                 let color = if status == "success" { "32" } else { "31" };
                 let first_line = preview.lines().next().unwrap_or("");
-                println!("  \x1b[{}m{} {}\x1b[0m", color, "result:", first_line);
+                println!("  \x1b[{color}mresult: {first_line}\x1b[0m");
 
                 // ExitPlanMode should abort the agent loop (matching Claude Code).
                 // Also clear history so plan mode system-reminder doesn't persist.

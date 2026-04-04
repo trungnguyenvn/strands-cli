@@ -30,6 +30,7 @@ pub struct ContextSetup {
     pub skills: Vec<crate::context::SkillSummary>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry, cwd: PathBuf, context_setup: ContextSetup, session_id: Option<String>, session_title: Option<String>, model: std::sync::Arc<dyn strands::types::models::Model>) -> strands::Result<()> {
     // Install panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -368,12 +369,10 @@ fn handle_key(
     }
 
     // --- Vim Insert mode: Esc returns to Normal ---
-    if app.state.vim_mode == VimMode::Insert {
-        if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
-            app.state.vim_mode = VimMode::Normal;
-            return;
-        }
-        // Fall through to normal key handling below
+    if app.state.vim_mode == VimMode::Insert && key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
+        app.state.vim_mode = VimMode::Normal;
+        return;
+        // Fall through to normal key handling below (when condition not met)
     }
 
     // --- Standard key handling (vim off or vim insert mode) ---

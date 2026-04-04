@@ -96,7 +96,7 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
             // Check per-message cache validity
             let valid = state.message_cache[i]
                 .as_ref()
-                .map_or(false, |c| c.is_valid(&state.messages[i], width));
+                .is_some_and(|c| c.is_valid(&state.messages[i], width));
 
             if !valid {
                 let lines = render_message(&state.messages[i], state.tick_count, width);
@@ -148,7 +148,7 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
     let mut all_lines: Vec<Line<'static>> = Vec::with_capacity(total_lines as usize);
     let mut cumulative: u16 = 0;
 
-    for i in 0..msg_count {
+    for (i, &msg_line_count) in line_counts.iter().enumerate() {
         // Separator between messages
         if i > 0 {
             let sep_pos = cumulative;
@@ -160,7 +160,7 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
             }
         }
 
-        let msg_line_count = line_counts[i];
+
         let msg_start = cumulative;
         let msg_end = cumulative + msg_line_count;
 

@@ -15,7 +15,7 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
 
     // Left side: contextual hint (like Claude Code's PromptInputFooterLeftSide)
     // Show "press Ctrl+C again to quit" when within the double-tap window
-    let ctrl_c_pending = state.last_ctrl_c_tick.map_or(false, |t| {
+    let ctrl_c_pending = state.last_ctrl_c_tick.is_some_and(|t| {
         state.tick_count.wrapping_sub(t) <= 24 // ~2 seconds at 12 Hz tick rate
     }) && !matches!(state.agent_status, AgentStatus::Streaming);
 
