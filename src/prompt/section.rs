@@ -11,6 +11,7 @@ pub struct RenderContext<'a> {
     pub git: Option<&'a GitContext>,
     pub date: &'a str,
     pub has_user_context: bool,
+    pub mcp_server_names: &'a [String],
 }
 
 /// A composable section of the system prompt.

@@ -32,6 +32,13 @@ impl PromptSection for EnvInfoSection {
             lines.push(" - Git: not a git repository".to_string());
         }
 
+        if !ctx.mcp_server_names.is_empty() {
+            lines.push(format!(
+                " - MCP servers: {}",
+                ctx.mcp_server_names.join(", ")
+            ));
+        }
+
         Some(lines.join("\n"))
     }
 }

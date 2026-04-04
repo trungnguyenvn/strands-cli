@@ -23,6 +23,7 @@ use strands_tools::{FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepToo
 
 mod commands;
 mod context;
+mod mcp;
 mod prompt;
 mod repl;
 mod tui;
@@ -78,13 +79,17 @@ async fn main() -> Result<()> {
     // Build model
     let model = build_model(&cli).await?;
 
-    // Build tools
-    let tools = build_tools();
+    // Build tools (native)
+    let mut tools = build_tools();
 
     // Gather context
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let git_ctx = context::get_git_status(&cwd);
     let user_ctx = context::get_user_context(&cwd);
+
+    // Load MCP servers — async; clients must stay alive for session duration
+    let mcp_session = mcp::load_mcp_servers(&cwd).await;
+    tools.extend(mcp_session.tools);
 
     // Build system prompt
     let tool_names: Vec<String> = tools.iter().map(|t| t.tool_name().to_string()).collect();
@@ -98,6 +103,7 @@ async fn main() -> Result<()> {
         git: git_ctx.as_ref(),
         date: &date,
         has_user_context: user_ctx.is_some(),
+        mcp_server_names: &mcp_session.server_names,
     };
     let source = match cli.system.clone() {
         Some(s) => prompt::PromptSource::Override(s),
