@@ -111,6 +111,17 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
     spans.push(sep.clone());
     spans.push(model);
 
+    // Session title (custom or AI-generated)
+    if let Some(ref title) = state.session_title {
+        let truncated = if title.chars().count() > 30 {
+            format!("{}…", title.chars().take(29).collect::<String>())
+        } else {
+            title.clone()
+        };
+        spans.push(sep.clone());
+        spans.push(Span::styled(truncated, Style::default().fg(Color::Cyan)));
+    }
+
     // Context window usage — always shown when available (matching Claude Code)
     if let Some(pct) = state.context_percent_used {
         let color = if state.context_critical {

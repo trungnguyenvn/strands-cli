@@ -172,7 +172,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                                         Ok((id, msgs)) => {
                                             agent.clear_history();
                                             for m in &msgs {
-                                                agent.add_message(m.clone());
+                                                agent.load_message(m.clone());
                                             }
                                             message_count = msgs.len();
                                             println!("{}", format!("Resumed session {} ({} messages)", id, msgs.len()).green());
@@ -185,6 +185,23 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                     }
                     continue;
                 }
+                DispatchResult::Local(CommandResult::SetSessionTitle(title)) => {
+                    if let Some(journal) = crate::session::get_journal() {
+                        let journal = std::sync::Arc::clone(journal);
+                        let t = title.clone();
+                        tokio::spawn(async move { let _ = journal.set_custom_title(t).await; });
+                    }
+                    println!("{}", format!("Session renamed to: {}", title).green());
+                    continue;
+                }
+                DispatchResult::Local(CommandResult::GenerateSessionTitle) => {
+                    println!("{}", "AI title generation is only available in TUI mode.".dimmed());
+                    continue;
+                }
+                DispatchResult::Local(CommandResult::Rewind) => {
+                    println!("{}", "Rewind is only available in TUI mode.".dimmed());
+                    continue;
+                }
                 DispatchResult::Local(CommandResult::ResumeSession(session_ref)) => {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
@@ -192,7 +209,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                         Ok((id, msgs)) => {
                             agent.clear_history();
                             for m in &msgs {
-                                agent.add_message(m.clone());
+                                agent.load_message(m.clone());
                             }
                             message_count = msgs.len();
                             println!("{}", format!("Resumed session {} ({} messages)", id, msgs.len()).green());

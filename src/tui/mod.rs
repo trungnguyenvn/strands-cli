@@ -30,7 +30,7 @@ pub struct ContextSetup {
     pub skills: Vec<crate::context::SkillSummary>,
 }
 
-pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry, cwd: PathBuf, context_setup: ContextSetup, session_id: Option<String>) -> strands::Result<()> {
+pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry, cwd: PathBuf, context_setup: ContextSetup, session_id: Option<String>, session_title: Option<String>, model: std::sync::Arc<dyn strands::types::models::Model>) -> strands::Result<()> {
     // Install panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -47,8 +47,13 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
     let mut tui = Tui::new(12.0, 30.0).map_err(|e| strands::Error::Configuration(e.to_string()))?;
     tui.enter_with_fullscreen(fullscreen).map_err(|e| strands::Error::Configuration(e.to_string()))?;
 
-    let mut app = TuiApp::new(agent, model_name, command_registry);
-    app.state.session_id = session_id;
+    let mut app = TuiApp::new(agent, model_name, command_registry, model);
+    app.state.session_id = session_id.clone();
+    app.state.session_title = session_title;
+    // Initialize file history for rewind support
+    if let Some(ref sid) = session_id {
+        strands_tools::file::file_history::init(sid);
+    }
     app.state.system_prompt_text = context_setup.system_prompt;
     app.state.tool_spec_summaries = context_setup.tool_specs;
     app.state.memory_files = context_setup.memory_files;
@@ -115,6 +120,43 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
                 if let Some(session) = mcp_slot.lock().unwrap().take() {
                     app.apply_mcp_session(session);
                 }
+            }
+            // Session title events
+            Event::AiTitleGenerated(ref title) => {
+                // Only set AI title if no custom title exists (custom always wins)
+                if app.state.session_title.is_none() {
+                    app.state.session_title = Some(title.clone());
+                    if let Some(journal) = crate::session::get_journal() {
+                        let journal = std::sync::Arc::clone(journal);
+                        let t = title.clone();
+                        tokio::spawn(async move {
+                            let _ = journal.set_ai_title(t).await;
+                        });
+                    }
+                }
+            }
+            Event::SessionTitleLoaded(title) => {
+                app.state.session_title = Some(title);
+            }
+            // Session resume — rebuild display list from SDK messages
+            Event::SessionResumed { messages, .. } => {
+                // Clear the "/resume ..." placeholder messages
+                app.state.messages.clear();
+                app.state.clear_render_caches();
+                // Convert SDK messages to display ChatMessages
+                for msg in &messages {
+                    let chat_msg = app::ChatMessage::from_sdk_message(msg);
+                    // Skip empty messages (e.g. tool results with no text)
+                    if !chat_msg.blocks.is_empty() {
+                        app.state.messages.push(chat_msg);
+                    }
+                }
+                // Update turn count to reflect resumed history
+                app.state.turn_count = app.state.messages.iter()
+                    .filter(|m| matches!(m.role, app::Role::User))
+                    .count();
+                app.state.auto_scroll = true;
+                app.state.scroll_offset = 0;
             }
             // Agent events
             Event::AgentTextDelta(_)
@@ -340,7 +382,7 @@ fn handle_key(
             handle_ctrl_c(app);
         }
 
-        // Escape — dismiss suggestions or cancel streaming
+        // Escape — dismiss suggestions, cancel streaming, or double-tap rewind
         (KeyModifiers::NONE, KeyCode::Esc) => {
             if !app.state.suggestions.is_empty() {
                 app.state.suggestions.clear();
@@ -351,6 +393,22 @@ fn handle_key(
                 }
                 app.state.agent_status = AgentStatus::Idle;
                 app.state.cancel_agent = None;
+            } else {
+                // Double-tap Esc to open rewind (mirrors Claude Code)
+                let has_input = !app.state.input.lines().join("").trim().is_empty();
+                let is_idle = matches!(app.state.agent_status, AgentStatus::Idle | AgentStatus::Error(_));
+                if !has_input && is_idle && !app.state.messages.is_empty() {
+                    if let Some(last_tick) = app.state.last_esc_tick {
+                        // 800ms window at 12Hz tick rate ≈ 10 ticks
+                        if app.state.tick_count.wrapping_sub(last_tick) <= 10 {
+                            app.set_input("/rewind ");
+                            app.update_suggestions();
+                            app.state.last_esc_tick = None;
+                            return;
+                        }
+                    }
+                    app.state.last_esc_tick = Some(app.state.tick_count);
+                }
             }
         }
 
@@ -452,6 +510,9 @@ fn handle_key(
                             } else if let Some(session_id) = app.selected_session_id() {
                                 app.reset_input();
                                 app.resume_session(session_id, event_tx.clone());
+                            } else if let Some((msg_idx, msg_id)) = app.selected_rewind_info() {
+                                app.reset_input();
+                                app.rewind_to(msg_idx, &msg_id);
                             } else {
                                 app.accept_suggestion();
                                 app.submit(event_tx);
@@ -477,6 +538,7 @@ fn handle_key(
         }
     }
 }
+
 
 /// Generate simple typeahead predictions based on input history.
 /// Mirrors Claude Code's speculation/promptSuggestion infrastructure.

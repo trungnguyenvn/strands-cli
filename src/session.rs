@@ -91,16 +91,36 @@ impl std::fmt::Display for SessionId {
 // ---------------------------------------------------------------------------
 
 /// Summary info for a discovered session file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: String,
     pub path: PathBuf,
     pub modified: DateTime<Local>,
     pub size_bytes: u64,
+    /// Resolved display title: custom_title > ai_title > truncated last_prompt > None.
+    pub display_title: Option<String>,
+    /// Git branch at the time of the most recent turn.
+    pub git_branch: Option<String>,
+}
+
+/// Compute a display title from a JournalSessionSummary.
+/// Priority: custom_title > ai_title > truncated(last_prompt).
+fn get_display_title(summary: &strands::types::journal::JournalSessionSummary) -> Option<String> {
+    summary.custom_title.clone()
+        .or_else(|| summary.ai_title.clone())
+        .or_else(|| summary.last_prompt.as_ref().map(|p| {
+            let trimmed = p.trim();
+            if trimmed.chars().count() > 60 {
+                format!("{}…", trimmed.chars().take(59).collect::<String>())
+            } else {
+                trimmed.to_string()
+            }
+        }))
 }
 
 /// List session files in the given directory, sorted by modification time
-/// (most recent first).
+/// (most recent first). Synchronous — does NOT load titles (use
+/// `list_sessions_with_titles` for that).
 pub fn list_sessions(sessions_dir: &Path) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(sessions_dir) else {
         return Vec::new();
@@ -123,6 +143,8 @@ pub fn list_sessions(sessions_dir: &Path) -> Vec<SessionSummary> {
                 path,
                 modified,
                 size_bytes: meta.len(),
+                display_title: None,
+                git_branch: None,
             })
         })
         .collect();
@@ -131,9 +153,72 @@ pub fn list_sessions(sessions_dir: &Path) -> Vec<SessionSummary> {
     sessions
 }
 
+/// List sessions with titles loaded from JSONL metadata.
+/// Async — calls the SDK's `load_session_summary()` for each session.
+pub async fn list_sessions_with_titles(sessions_dir: &Path) -> Vec<SessionSummary> {
+    use strands::session::journal_session_manager::load_session_summary;
+
+    let mut sessions = list_sessions(sessions_dir);
+
+    // Enrich with titles (limit to first 20 to avoid excessive I/O)
+    for s in sessions.iter_mut().take(20) {
+        if let Ok(sdk_summary) = load_session_summary(&s.path).await {
+            s.display_title = get_display_title(&sdk_summary);
+            s.git_branch = sdk_summary.git_branch;
+        }
+    }
+
+    sessions
+}
+
+// ---------------------------------------------------------------------------
+// Session cache for sync autocomplete access
+// ---------------------------------------------------------------------------
+
+static SESSION_CACHE: std::sync::OnceLock<parking_lot::RwLock<Vec<SessionSummary>>> =
+    std::sync::OnceLock::new();
+
+fn cache() -> &'static parking_lot::RwLock<Vec<SessionSummary>> {
+    SESSION_CACHE.get_or_init(|| parking_lot::RwLock::new(Vec::new()))
+}
+
+/// Refresh the session cache in the background. Non-blocking.
+/// Safe to call outside a tokio runtime context (will silently no-op).
+pub fn refresh_session_cache() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let dir = SessionId::storage_dir(&cwd);
+            let sessions = list_sessions_with_titles(&dir).await;
+            *cache().write() = sessions;
+        });
+    }
+}
+
+/// Read the cached session list (non-blocking, may be stale).
+pub fn cached_sessions() -> Vec<SessionSummary> {
+    cache().read().clone()
+}
+
+/// Directly set the session cache (for testing).
+#[cfg(test)]
+pub fn set_session_cache(sessions: Vec<SessionSummary>) {
+    *cache().write() = sessions;
+}
+
 /// Find the most recently modified session file.
 pub fn find_most_recent_session(sessions_dir: &Path) -> Option<SessionSummary> {
     list_sessions(sessions_dir).into_iter().next()
+}
+
+/// Result of resolving and loading a session.
+pub struct ResolvedSession {
+    pub session_id: String,
+    pub messages: Vec<strands::types::content::Message>,
+    /// Display title (custom_title > ai_title).
+    pub title: Option<String>,
+    /// Git branch at the time of the most recent turn.
+    pub git_branch: Option<String>,
 }
 
 /// Resolve a session reference ("latest", a session ID, or a file path) and
@@ -144,6 +229,15 @@ pub async fn resolve_and_load(
     sessions_dir: &Path,
     reference: &str,
 ) -> std::result::Result<(String, Vec<strands::types::content::Message>), String> {
+    let resolved = resolve_and_load_full(sessions_dir, reference).await?;
+    Ok((resolved.session_id, resolved.messages))
+}
+
+/// Like `resolve_and_load` but also returns the session title.
+pub async fn resolve_and_load_full(
+    sessions_dir: &Path,
+    reference: &str,
+) -> std::result::Result<ResolvedSession, String> {
     use strands::session::journal_session_manager::{
         build_conversation_chain, load_journal, load_session_by_id,
     };
@@ -179,6 +273,11 @@ pub async fn resolve_and_load(
             }
         }
     };
+
+    // Extract title: custom_title wins over ai_title (matches TypeScript priority)
+    let title = loaded.custom_title.clone().or_else(|| loaded.ai_title.clone());
+    let git_branch = loaded.git_branch.clone();
+
     let messages = if let Some(leaf) = loaded.last_chain_uuid {
         build_conversation_chain(&loaded, leaf)
     } else {
@@ -187,7 +286,12 @@ pub async fn resolve_and_load(
 
     let messages = sanitize_messages_for_api(messages);
 
-    Ok((session_id, messages))
+    Ok(ResolvedSession {
+        session_id,
+        messages,
+        title,
+        git_branch,
+    })
 }
 
 // ---------------------------------------------------------------------------

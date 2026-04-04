@@ -1,5 +1,7 @@
 //! Application state and event dispatch for the TUI.
 
+use std::sync::Arc;
+
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -111,6 +113,49 @@ impl ChatMessage {
                 return;
             }
         }
+    }
+
+    /// Convert an SDK Message into a display ChatMessage.
+    /// Used to rebuild the display list when resuming a session.
+    pub fn from_sdk_message(msg: &strands::types::content::Message) -> Self {
+        let role = match msg.role {
+            strands::types::content::Role::User => Role::User,
+            _ => Role::Assistant,
+        };
+        let mut blocks = Vec::new();
+        for block in &msg.content {
+            match block {
+                strands::types::content::ContentBlock::Text { text, .. } => {
+                    blocks.push(ContentBlock::Text(text.clone()));
+                }
+                strands::types::content::ContentBlock::ToolUse { name, input, .. } => {
+                    let summary = crate::repl::tool_call_summary(name, input);
+                    blocks.push(ContentBlock::ToolCall {
+                        name: name.clone(),
+                        summary,
+                        status: ToolCallStatus::Success,
+                        group_key: tool_group_key(name),
+                    });
+                }
+                strands::types::content::ContentBlock::ToolResult { content, is_error, .. } => {
+                    // Show tool results as text (truncated)
+                    let text = content.iter().filter_map(|c| {
+                        c.text.as_deref()
+                    }).collect::<Vec<_>>().join("");
+                    if !text.is_empty() {
+                        let truncated = if text.len() > 200 {
+                            format!("{}…", &text[..199])
+                        } else {
+                            text
+                        };
+                        let status = if *is_error { "error" } else { "success" };
+                        blocks.push(ContentBlock::Text(format!("[{}: {}]", status, truncated)));
+                    }
+                }
+                _ => {} // Skip Image, Document, etc.
+            }
+        }
+        Self { role, blocks }
     }
 
     /// Extract all text content from this message's blocks.
@@ -360,8 +405,16 @@ pub struct AppState {
 
     // --- Session persistence ---
 
+    // --- Rewind ---
+
+    /// Tick count when Esc was last pressed on empty input (for double-tap rewind).
+    pub last_esc_tick: Option<usize>,
+
     /// Current session ID (displayed in status bar, used for /session commands).
     pub session_id: Option<String>,
+    /// Session title (custom or AI-generated). Displayed in status bar.
+    /// Priority: custom_title > ai_title > None.
+    pub session_title: Option<String>,
 }
 
 /// Permission modes matching Claude Code's Shift+Tab cycle.
@@ -475,7 +528,9 @@ impl AppState {
             tool_spec_summaries: Vec::new(),
             memory_files: Vec::new(),
             skill_summaries: Vec::new(),
+            last_esc_tick: None,
             session_id: None,
+            session_title: None,
         }
     }
 
@@ -493,18 +548,27 @@ impl AppState {
 pub struct TuiApp {
     pub state: AppState,
     agent: Agent,
+    /// Model reference for background tasks (e.g. AI title generation).
+    model: Arc<dyn strands::types::models::Model>,
     /// MCP clients kept alive for session duration (Drop kills subprocesses / closes HTTP sessions).
     #[allow(dead_code)]
     _mcp_clients: Option<(Vec<strands::tools::mcp::MCPClient>, Vec<strands::tools::mcp::MCPHttpClient>)>,
 }
 
 impl TuiApp {
-    pub fn new(agent: Agent, model_name: String, command_registry: CommandRegistry) -> Self {
+    pub fn new(agent: Agent, model_name: String, command_registry: CommandRegistry, model: Arc<dyn strands::types::models::Model>) -> Self {
         Self {
             state: AppState::new(model_name, command_registry, Vec::new()),
             agent,
+            model,
             _mcp_clients: None,
         }
+    }
+
+    /// Get a reference to the underlying agent (for hook registration in tests).
+    #[cfg(test)]
+    pub fn agent_ref(&self) -> &Agent {
+        &self.agent
     }
 
     /// Absorb a loaded MCP session — registers tools on the agent at runtime
@@ -582,6 +646,7 @@ impl TuiApp {
                     self.state.messages.clear();
                     self.state.clear_render_caches();
                     self.agent.clear_history();
+                    strands_tools::file::file_history::clear();
                     self.reset_input();
                     return;
                 }
@@ -611,6 +676,11 @@ impl TuiApp {
                     self.update_suggestions();
                     return;
                 }
+                DispatchResult::Local(CommandResult::Rewind) => {
+                    self.set_input("/rewind ");
+                    self.update_suggestions();
+                    return;
+                }
                 DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
                     self.reset_input();
                     self.switch_model(model_id, event_tx);
@@ -624,6 +694,33 @@ impl TuiApp {
                 DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
                     self.apply_mode_switch(&mode_name);
                     self.reset_input();
+                    return;
+                }
+                DispatchResult::Local(CommandResult::SetSessionTitle(title)) => {
+                    if let Some(journal) = crate::session::get_journal() {
+                        let journal = std::sync::Arc::clone(journal);
+                        let t = title.clone();
+                        tokio::spawn(async move { let _ = journal.set_custom_title(t).await; });
+                    }
+                    self.state.session_title = Some(title.clone());
+                    self.state.messages.push(ChatMessage::user(trimmed.to_string()));
+                    let mut msg = ChatMessage::assistant_empty();
+                    msg.append_text(&format!("Session renamed to: {}", title));
+                    self.state.messages.push(msg);
+                    self.state.auto_scroll = true;
+                    self.state.scroll_offset = 0;
+                    self.reset_input();
+                    return;
+                }
+                DispatchResult::Local(CommandResult::GenerateSessionTitle) => {
+                    self.state.messages.push(ChatMessage::user(trimmed.to_string()));
+                    let mut msg = ChatMessage::assistant_empty();
+                    msg.append_text("Generating session title...");
+                    self.state.messages.push(msg);
+                    self.state.auto_scroll = true;
+                    self.state.scroll_offset = 0;
+                    self.reset_input();
+                    self.trigger_ai_title_generation(event_tx);
                     return;
                 }
                 DispatchResult::Prompt(expanded) => {
@@ -691,14 +788,25 @@ impl TuiApp {
         self.state.history_stash.clear();
         self.state.turn_count += 1;
 
-        // Record last prompt in session journal (fire-and-forget)
+        // Record last prompt and git branch in session journal (fire-and-forget)
         if let Some(journal) = crate::session::get_journal() {
             let journal = std::sync::Arc::clone(journal);
             let prompt_text = prompt.clone();
             tokio::spawn(async move {
                 let _ = journal.set_last_prompt(prompt_text).await;
+                // Record current git branch (matches TypeScript per-turn stamping)
+                if let Some(ctx) = crate::context::get_git_status(
+                    &std::env::current_dir().unwrap_or_default(),
+                ) {
+                    let _ = journal.set_git_branch(ctx.branch).await;
+                }
             });
         }
+
+        // Create file history snapshot for rewind support.
+        // The snapshot ID = "msg-{index}" matches the convention in open_message_selector.
+        let msg_index = self.state.messages.len();
+        strands_tools::file::file_history::make_snapshot(&format!("msg-{}", msg_index));
 
         // Add user message (shown in UI as-is)
         self.state.messages.push(ChatMessage::user(prompt.clone()));
@@ -723,11 +831,28 @@ impl TuiApp {
         self.agent.reset_cancel();
         self.state.cancel_agent = Some(self.agent.clone());
 
+        // Auto-generate session title on first user message (matches Claude Code behavior)
+        let first_msg_for_title = if self.state.turn_count == 1 && self.state.session_title.is_none() {
+            Some(agent_prompt.chars().take(500).collect::<String>())
+        } else {
+            None
+        };
+
         // Spawn agent streaming task
         let agent = self.agent.clone();
+        let event_tx_for_title = event_tx.clone();
         tokio::spawn(async move {
             Self::run_agent_stream(agent, &agent_prompt, event_tx).await;
         });
+
+        if let Some(first_msg) = first_msg_for_title {
+            let model = Arc::clone(&self.model);
+            tokio::spawn(async move {
+                if let Some(title) = crate::title_generator::generate_session_title(&first_msg, model).await {
+                    let _ = event_tx_for_title.send(Event::AiTitleGenerated(title));
+                }
+            });
+        }
     }
 
     /// Try to execute an immediate slash command while the agent is streaming.
@@ -807,6 +932,7 @@ impl TuiApp {
                 self.state.messages.clear();
                 self.state.clear_render_caches();
                 self.agent.clear_history();
+                strands_tools::file::file_history::clear();
                 self.state.agent_status = AgentStatus::Idle;
                 self.state.cancel_agent = None;
                 self.reset_input();
@@ -825,6 +951,21 @@ impl TuiApp {
             }
             DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
                 self.apply_mode_switch(&mode_name);
+                self.reset_input();
+            }
+            DispatchResult::Local(CommandResult::SetSessionTitle(title)) => {
+                if let Some(journal) = crate::session::get_journal() {
+                    let journal = std::sync::Arc::clone(journal);
+                    let t = title.clone();
+                    tokio::spawn(async move { let _ = journal.set_custom_title(t).await; });
+                }
+                self.state.session_title = Some(title.clone());
+                self.state.messages.push(ChatMessage::user(trimmed.to_string()));
+                let mut msg = ChatMessage::assistant_empty();
+                msg.append_text(&format!("Session renamed to: {}", title));
+                self.state.messages.push(msg);
+                self.state.auto_scroll = true;
+                self.state.scroll_offset = 0;
                 self.reset_input();
             }
             _ => {} // Non-local or prompt commands are not allowed during streaming
@@ -923,7 +1064,7 @@ impl TuiApp {
     }
 
     /// Set the input textarea to a specific string.
-    fn set_input(&mut self, text: &str) {
+    pub fn set_input(&mut self, text: &str) {
         self.state.input = tui_textarea::TextArea::default();
         self.state.input.set_cursor_line_style(ratatui::style::Style::default());
         self.state.input.set_placeholder_text("/help");
@@ -936,8 +1077,22 @@ impl TuiApp {
     /// Called after every keystroke. Mirrors Claude Code's `updateSuggestions`.
     pub fn update_suggestions(&mut self) {
         let text = self.state.input.lines().join("\n");
-        let new_suggestions =
-            commands::generate_suggestions(&text, &self.state.command_registry, &self.state.model_name);
+        let trimmed = text.trim();
+
+        // `/rewind` — generate rewind suggestions from message history (like /resume)
+        let new_suggestions = if trimmed == "/rewind" || trimmed == "/checkpoint"
+            || trimmed.starts_with("/rewind ") || trimmed.starts_with("/checkpoint ")
+        {
+            let query = trimmed
+                .strip_prefix("/rewind")
+                .or_else(|| trimmed.strip_prefix("/checkpoint"))
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            self.generate_rewind_suggestions(&query)
+        } else {
+            commands::generate_suggestions(&text, &self.state.command_registry, &self.state.model_name)
+        };
 
         if new_suggestions.is_empty() {
             self.state.suggestions.clear();
@@ -1021,6 +1176,18 @@ impl TuiApp {
             .clone()
     }
 
+    /// If the selected suggestion is a rewind target, return (message_index, message_id).
+    pub fn selected_rewind_info(&self) -> Option<(usize, String)> {
+        if self.state.selected_suggestion < 0
+            || self.state.selected_suggestion as usize >= self.state.suggestions.len()
+        {
+            return None;
+        }
+        self.state.suggestions[self.state.selected_suggestion as usize]
+            .rewind_info
+            .clone()
+    }
+
     /// Resume a session by loading its messages and replacing current conversation.
     pub fn resume_session(
         &mut self,
@@ -1040,15 +1207,25 @@ impl TuiApp {
         tokio::spawn(async move {
             let cwd = std::env::current_dir().unwrap_or_default();
             let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
-            match crate::session::resolve_and_load(&sessions_dir, &session_ref).await {
-                Ok((id, msgs)) => {
-                    // Replace agent conversation with loaded messages
+            match crate::session::resolve_and_load_full(&sessions_dir, &session_ref).await {
+                Ok(resolved) => {
+                    // Replace agent conversation with loaded messages.
+                    // Use load_message (no hooks) to avoid re-writing them to the journal.
                     agent.clear_history();
-                    for m in &msgs {
-                        agent.add_message(m.clone());
+                    for m in &resolved.messages {
+                        agent.load_message(m.clone());
                     }
+                    // Load the session title if available
+                    if let Some(title) = resolved.title {
+                        let _ = event_tx_clone.send(Event::SessionTitleLoaded(title));
+                    }
+                    // Send messages to TUI for display list reconstruction
+                    let _ = event_tx_clone.send(Event::SessionResumed {
+                        session_id: resolved.session_id.clone(),
+                        messages: resolved.messages.clone(),
+                    });
                     let _ = event_tx_clone.send(Event::AgentTextDelta(
-                        format!("\nResumed session {} ({} messages)", id, msgs.len()),
+                        format!("\nResumed session {} ({} messages)", resolved.session_id, resolved.messages.len()),
                     ));
                     let _ = event_tx_clone.send(Event::AgentDone);
                 }
@@ -1057,6 +1234,32 @@ impl TuiApp {
                         format!("Failed to resume: {}", e),
                     ));
                 }
+            }
+        });
+    }
+
+    /// Trigger AI title generation from the conversation messages.
+    /// Used by `/rename` with no args.
+    fn trigger_ai_title_generation(&self, event_tx: UnboundedSender<Event>) {
+        // Build conversation summary from recent messages
+        let conversation_text: String = self
+            .state
+            .messages
+            .iter()
+            .filter(|m| !m.text_content().is_empty())
+            .take(10)
+            .map(|m| m.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if conversation_text.is_empty() {
+            return;
+        }
+
+        let model = Arc::clone(&self.model);
+        tokio::spawn(async move {
+            if let Some(title) = crate::title_generator::generate_session_title(&conversation_text, model).await {
+                let _ = event_tx.send(Event::AiTitleGenerated(title));
             }
         });
     }
@@ -1160,7 +1363,151 @@ impl TuiApp {
         }
     }
 
-    /// Handle an agent stream event — mutate state accordingly.
+    /// Generate rewind suggestions from conversation history.
+    /// Each user message is a rewind target, shown most recent first.
+    fn generate_rewind_suggestions(&self, query: &str) -> Vec<SuggestionItem> {
+        let mut turn = 0usize;
+        let mut items: Vec<SuggestionItem> = Vec::new();
+
+        for (i, msg) in self.state.messages.iter().enumerate() {
+            if matches!(msg.role, Role::User) {
+                turn += 1;
+                let text = msg.text_content();
+                // Skip slash commands — not useful rewind targets
+                if text.trim().starts_with('/') {
+                    continue;
+                }
+                let message_id = format!("msg-{}", i);
+                let has_changes = strands_tools::file::file_history::has_changes_since(&message_id);
+                let file_tag = if has_changes { " [files changed]" } else { "" };
+
+                let truncated = if text.len() > 60 {
+                    format!("{}…", &text[..60])
+                } else {
+                    text.clone()
+                };
+
+                let name = format!("Turn {}", turn);
+                let description = format!("{}{}", truncated, file_tag);
+
+                // Filter by query
+                if !query.is_empty()
+                    && !name.to_lowercase().contains(query)
+                    && !text.to_lowercase().contains(query)
+                {
+                    continue;
+                }
+
+                items.push(SuggestionItem {
+                    name,
+                    description,
+                    model_id: None,
+                    session_id: None,
+                    rewind_info: Some((i, message_id)),
+                });
+            }
+        }
+
+        // Most recent first
+        items.reverse();
+        items.truncate(10);
+        items
+    }
+
+    /// Rewind conversation and/or files to a given message index.
+    ///
+    /// Called when the user selects a rewind suggestion from the `/rewind ` dropdown.
+    /// `message_index` is the index into `self.state.messages` of the target user message.
+    /// `message_id` is the file-history snapshot ID (e.g. "msg-5").
+    pub fn rewind_to(&mut self, message_index: usize, message_id: &str) {
+        let mut result_lines = Vec::new();
+
+        // Count the turn number for display
+        let turn_number = self.state.messages[..message_index]
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .count() + 1;
+
+        // Restore files from snapshot
+        match strands_tools::file::file_history::rewind_to_snapshot(message_id) {
+            Ok(stats) => {
+                if stats.files_changed > 0 {
+                    result_lines.push(format!(
+                        "Restored {} file(s) ({} restored, {} deleted)",
+                        stats.files_changed, stats.files_restored, stats.files_deleted
+                    ));
+                }
+            }
+            Err(_) => {} // No snapshot or no changes — that's fine
+        }
+
+        // Truncate conversation to just before the selected message
+        self.state.messages.truncate(message_index);
+        self.state.message_cache.truncate(message_index);
+        self.state.streaming_md_cache = None;
+
+        // Truncate the agent's internal message history to match
+        let sdk_msg_count = {
+            let sdk_messages = self.agent.get_messages();
+            let ui_user_count = self.state.messages.iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .count();
+            let mut sdk_user_count = 0;
+            let mut target = sdk_messages.len();
+            for (i, msg) in sdk_messages.iter().enumerate() {
+                if msg.role == strands::types::content::Role::User {
+                    sdk_user_count += 1;
+                    if sdk_user_count > ui_user_count {
+                        target = i;
+                        break;
+                    }
+                }
+            }
+            target
+        };
+        self.agent.truncate_messages(sdk_msg_count);
+        self.agent.reset_conversation_context();
+
+        // Write a rewind marker to the JSONL journal so that resume
+        // reconstructs the post-rewind conversation (fixes Bug B).
+        if let Some(journal) = crate::session::get_journal() {
+            let journal = std::sync::Arc::clone(journal);
+            let target_count = sdk_msg_count;
+            tokio::spawn(async move {
+                // Load the journal to find the UUID of the target message
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
+                let path = sessions_dir.join(format!("{}.jsonl", journal.session_id()));
+                if let Ok(loaded) = strands::session::journal_session_manager::load_journal(&path).await {
+                    // Find the UUID of the message at target_count - 1
+                    // (0-indexed: the last message to keep)
+                    let mut msg_idx = 0;
+                    let mut target_uuid = None;
+                    for (uuid, entry) in &loaded.messages {
+                        if let strands::types::journal::JournalEntry::Message { .. } = entry {
+                            msg_idx += 1;
+                            if msg_idx == target_count {
+                                target_uuid = Some(*uuid);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(uuid) = target_uuid {
+                        let _ = journal.set_rewind_marker(uuid).await;
+                    }
+                }
+            });
+        }
+
+        result_lines.insert(0, format!("Rewound to Turn {}", turn_number));
+
+        let mut msg = ChatMessage::assistant_empty();
+        msg.append_text(&format!("[Rewind] {}", result_lines.join(". ")));
+        self.state.messages.push(msg);
+        self.state.auto_scroll = true;
+        self.state.scroll_offset = 0;
+    }
+
     pub fn handle_agent_event(&mut self, event: Event) {
         let last_msg = self.state.messages.last_mut();
 

@@ -33,6 +33,7 @@ mod mcp;
 mod prompt;
 mod repl;
 pub mod session;
+pub mod title_generator;
 mod tui;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,10 @@ struct Cli {
     /// Specific session ID to resume (implies --resume)
     #[arg(long)]
     session: Option<String>,
+
+    /// Set a name/title for this session
+    #[arg(short = 'n', long = "name")]
+    name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +106,8 @@ async fn main() -> Result<()> {
 
     // Build model
     let model = build_model(&cli).await?;
+    // Keep a clone for background tasks (e.g. AI title generation)
+    let model_for_tui = Arc::clone(&model);
 
     // Build tools (native)
     let mut tools = build_tools();
@@ -170,19 +177,19 @@ async fn main() -> Result<()> {
 
     // Determine session ID: resume an existing session or create a new one
     let resume_ref = cli.session.as_deref().or(if cli.resume { Some("latest") } else { None });
-    let (session_id, resumed_messages) = if let Some(session_ref) = resume_ref {
-        match session::resolve_and_load(&sessions_dir, session_ref).await {
-            Ok((id, msgs)) => {
-                eprintln!("Resumed session {} ({} messages)", id, msgs.len());
-                (session::SessionId::from_existing(id), msgs)
+    let (session_id, resumed_messages, mut session_title) = if let Some(session_ref) = resume_ref {
+        match session::resolve_and_load_full(&sessions_dir, session_ref).await {
+            Ok(resolved) => {
+                eprintln!("Resumed session {} ({} messages)", resolved.session_id, resolved.messages.len());
+                (session::SessionId::from_existing(resolved.session_id), resolved.messages, resolved.title)
             }
             Err(e) => {
                 eprintln!("Warning: could not resume session: {e}");
-                (session::SessionId::new(), Vec::new())
+                (session::SessionId::new(), Vec::new(), None)
             }
         }
     } else {
-        (session::SessionId::new(), Vec::new())
+        (session::SessionId::new(), Vec::new(), None)
     };
 
     let journal_mgr = strands::session::JournalSessionManager::new(
@@ -195,6 +202,16 @@ async fn main() -> Result<()> {
     session::set_journal(Arc::clone(&journal_mgr));
     // Keep a clone for registering hooks after agent build (the Arc is moved into the builder)
     let journal_for_hooks = Arc::clone(&journal_mgr);
+
+    // --name flag: set a custom session title (overrides any resumed title)
+    if let Some(ref name) = cli.name {
+        session_title = Some(name.clone());
+        let journal = Arc::clone(&journal_for_hooks);
+        let title = name.clone();
+        tokio::spawn(async move {
+            let _ = journal.set_custom_title(title).await;
+        });
+    }
 
     // Build agent with proactive context management
     let summarizing = Arc::new(
@@ -309,11 +326,12 @@ async fn main() -> Result<()> {
             memory_files: memory_file_data,
             skills: skill_data,
         };
-        tui::run(agent, model_name, command_registry, cwd, ctx_setup, Some(session_id.as_str().to_string())).await?;
+        tui::run(agent, model_name, command_registry, cwd, ctx_setup, Some(session_id.as_str().to_string()), session_title, model_for_tui).await?;
     }
 
-    // Flush session journal before exit
+    // Re-append metadata and flush session journal before exit
     if let Some(journal) = session::get_journal() {
+        let _ = journal.reappend_metadata().await;
         let _ = journal.flush().await;
     }
 

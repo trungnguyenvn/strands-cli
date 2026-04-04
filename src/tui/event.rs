@@ -31,4 +31,17 @@ pub enum Event {
     // MCP lifecycle
     /// MCP servers finished loading in the background.
     McpLoaded,
+
+    // Session title events
+    /// AI-generated session title received (from background model call).
+    AiTitleGenerated(String),
+    /// Session title loaded from disk (on resume).
+    SessionTitleLoaded(String),
+
+    // Session resume events
+    /// Session resumed — carry SDK messages so the TUI can rebuild the display list.
+    SessionResumed {
+        session_id: String,
+        messages: Vec<strands::types::content::Message>,
+    },
 }

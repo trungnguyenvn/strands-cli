@@ -88,6 +88,12 @@ pub enum CommandResult {
     ResumeSession(String),
     /// Open the session picker — set input to `/resume ` and show session suggestions.
     SessionPicker,
+    /// Open the message selector for rewinding conversation and/or files.
+    Rewind,
+    /// Set a custom session title (from /rename or /session title).
+    SetSessionTitle(String),
+    /// Generate an AI session title (from /rename with no args).
+    GenerateSessionTitle,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +259,7 @@ impl CommandRegistry {
 /// Names of built-in commands (used to distinguish from skills in /help).
 fn builtin_command_names() -> &'static [&'static str] {
     &["exit", "clear", "help", "status", "compact", "model", "skills", "mcp",
-      "plan", "default", "accept-edits", "bypass", "context"]
+      "plan", "default", "accept-edits", "bypass", "context", "rewind"]
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +518,32 @@ fn builtin_commands() -> Vec<Command> {
                 execute: cmd_session,
             },
         },
+        // /rewind (alias: /checkpoint)
+        Command {
+            name: "rewind".into(),
+            description: "Rewind conversation and/or code to a previous point".into(),
+            aliases: vec!["checkpoint".into()],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: |_, _| CommandResult::Rewind,
+            },
+        },
+        // /rename
+        Command {
+            name: "rename".into(),
+            description: "Rename this session (or auto-generate a title)".into(),
+            aliases: vec![],
+            is_hidden: false,
+            argument_hint: Some("[name]".into()),
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: cmd_rename,
+            },
+        },
     ]
 }
 
@@ -624,18 +656,53 @@ fn cmd_session(args: &str, _ctx: &CommandContext) -> CommandResult {
             }
         }
         "list" => {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let dir = crate::session::SessionId::storage_dir(&cwd);
-            let sessions = crate::session::list_sessions(&dir);
+            // Try cached sessions (with titles) first, fall back to sync listing
+            let sessions = {
+                let cached = crate::session::cached_sessions();
+                if cached.is_empty() {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let dir = crate::session::SessionId::storage_dir(&cwd);
+                    crate::session::list_sessions(&dir)
+                } else {
+                    cached
+                }
+            };
             if sessions.is_empty() {
                 CommandResult::Text("No sessions found.".to_string())
             } else {
-                let mut lines = vec![format!("{:<3}  {:<38}  {:>8}  {}", "#", "Session ID", "Size", "Modified")];
+                let mut lines = vec![format!(
+                    "{:<3}  {:<38}  {:<24}  {:<16}  {:>8}  {}",
+                    "#", "Session ID", "Title", "Branch", "Size", "Modified"
+                )];
                 for (i, s) in sessions.iter().take(20).enumerate() {
+                    let title_display = s
+                        .display_title
+                        .as_deref()
+                        .map(|t| {
+                            if t.chars().count() > 22 {
+                                format!("{}…", t.chars().take(21).collect::<String>())
+                            } else {
+                                t.to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "—".to_string());
+                    let branch_display = s
+                        .git_branch
+                        .as_deref()
+                        .map(|b| {
+                            if b.chars().count() > 14 {
+                                format!("{}…", b.chars().take(13).collect::<String>())
+                            } else {
+                                b.to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "—".to_string());
                     lines.push(format!(
-                        "{:<3}  {:<38}  {:>6}KB  {}",
+                        "{:<3}  {:<38}  {:<24}  {:<16}  {:>6}KB  {}",
                         i + 1,
                         s.session_id,
+                        title_display,
+                        branch_display,
                         s.size_bytes / 1024,
                         s.modified.format("%Y-%m-%d %H:%M"),
                     ));
@@ -648,14 +715,7 @@ fn cmd_session(args: &str, _ctx: &CommandContext) -> CommandResult {
             if title.is_empty() {
                 return CommandResult::Text("Usage: /session title <text>".to_string());
             }
-            if let Some(journal) = crate::session::get_journal() {
-                let journal = std::sync::Arc::clone(journal);
-                let title = title.to_string();
-                tokio::spawn(async move { let _ = journal.set_custom_title(title).await; });
-                CommandResult::Text("Session title updated.".to_string())
-            } else {
-                CommandResult::Text("No active session".to_string())
-            }
+            CommandResult::SetSessionTitle(title.to_string())
         }
         "tag" => {
             let tag = sub_args.trim();
@@ -685,6 +745,15 @@ fn cmd_session(args: &str, _ctx: &CommandContext) -> CommandResult {
             "Unknown subcommand: '{}'. Available: list, id, title, tag, export",
             other,
         )),
+    }
+}
+
+fn cmd_rename(args: &str, _ctx: &CommandContext) -> CommandResult {
+    let title = args.trim();
+    if title.is_empty() {
+        CommandResult::GenerateSessionTitle
+    } else {
+        CommandResult::SetSessionTitle(title.to_string())
     }
 }
 
@@ -1185,6 +1254,9 @@ pub struct SuggestionItem {
     /// When set, this suggestion represents a session to resume.
     /// Accepting it should trigger session resume instead of filling the input.
     pub session_id: Option<String>,
+    /// When set, this suggestion represents a rewind target.
+    /// (message_index, message_id) — selecting it triggers a rewind.
+    pub rewind_info: Option<(usize, String)>,
 }
 
 /// Generate command suggestions for a partial input.
@@ -1238,6 +1310,7 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_mod
             description: cmd.description.clone(),
             model_id: None,
             session_id: None,
+            rewind_info: None,
         })
         .collect();
 
@@ -1282,6 +1355,7 @@ fn generate_model_suggestions(query: &str, current_model: &str) -> Vec<Suggestio
                 description,
                 model_id: Some(item.model_id),
                 session_id: None,
+                rewind_info: None,
             }
         })
         .collect();
@@ -1304,34 +1378,68 @@ fn generate_model_suggestions(query: &str, current_model: &str) -> Vec<Suggestio
 }
 
 fn generate_session_suggestions(query: &str) -> Vec<SuggestionItem> {
+    // Trigger a cache refresh (non-blocking) so titles are available next time
+    crate::session::refresh_session_cache();
+
+    // Always read from disk to pick up newly-created sessions (e.g. after /new).
+    // Layer cached titles on top for display.
     let cwd = std::env::current_dir().unwrap_or_default();
     let dir = crate::session::SessionId::storage_dir(&cwd);
-    let sessions = crate::session::list_sessions(&dir);
+    let mut sessions = crate::session::list_sessions(&dir);
+
+    // Merge titles from cache (async-loaded with full JSONL parsing)
+    let cached = crate::session::cached_sessions();
+    for s in &mut sessions {
+        if s.display_title.is_none() {
+            if let Some(cached_s) = cached.iter().find(|c| c.session_id == s.session_id) {
+                s.display_title.clone_from(&cached_s.display_title);
+                s.git_branch.clone_from(&cached_s.git_branch);
+            }
+        }
+    }
 
     sessions
         .into_iter()
         .take(10)
         .filter(|s| {
-            query.is_empty()
-                || s.session_id.to_lowercase().contains(query)
+            if query.is_empty() {
+                return true;
+            }
+            let q = query.to_lowercase();
+            s.session_id.to_lowercase().contains(&q)
+                || s.display_title
+                    .as_ref()
+                    .map_or(false, |t| t.to_lowercase().contains(&q))
+                || s.git_branch
+                    .as_ref()
+                    .map_or(false, |b| b.to_lowercase().contains(&q))
         })
         .map(|s| {
-            let desc = format!(
-                "{} · {}KB",
-                s.modified.format("%Y-%m-%d %H:%M"),
-                s.size_bytes / 1024,
-            );
-            // Show abbreviated ID as the name
-            let abbrev = if s.session_id.len() > 12 {
+            // Build description: "date · branch · sizeKB"
+            let mut parts = vec![s.modified.format("%Y-%m-%d %H:%M").to_string()];
+            if let Some(ref branch) = s.git_branch {
+                parts.push(branch.clone());
+            }
+            parts.push(format!("{}KB", s.size_bytes / 1024));
+            let desc = parts.join(" · ");
+            // Show title as the name if available, otherwise abbreviated ID
+            let name = if let Some(ref title) = s.display_title {
+                if title.chars().count() > 30 {
+                    format!("{}…", title.chars().take(29).collect::<String>())
+                } else {
+                    title.clone()
+                }
+            } else if s.session_id.len() > 12 {
                 format!("{}…", &s.session_id[..12])
             } else {
                 s.session_id.clone()
             };
             SuggestionItem {
-                name: abbrev,
+                name,
                 description: desc,
                 model_id: None,
                 session_id: Some(s.session_id),
+                rewind_info: None,
             }
         })
         .collect()
