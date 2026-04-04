@@ -188,6 +188,31 @@ impl Selection {
     }
 }
 
+/// Vim input mode — mirrors Claude Code's vim mode support.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VimMode {
+    Off,
+    Normal,
+    Insert,
+}
+
+/// A pending permission request for a tool call.
+#[derive(Clone, Debug)]
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub tool_input_summary: String,
+    /// true = allow, false = deny, None = pending
+    pub decision: Option<bool>,
+}
+
+/// Cached rendered lines to avoid re-rendering markdown every frame.
+#[derive(Clone)]
+pub struct CachedRender {
+    pub lines: Vec<ratatui::text::Line<'static>>,
+    pub message_gen: usize,
+    pub terminal_width: u16,
+}
+
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub scroll_offset: u16,
@@ -217,6 +242,32 @@ pub struct AppState {
     pub mcp_status: McpStatus,
     /// Text selection state for mouse copy.
     pub selection: Selection,
+
+    // --- New features (closing gaps with Claude Code) ---
+
+    /// Vim mode state (Off/Normal/Insert).
+    pub vim_mode: VimMode,
+    /// Unseen messages: line index where the divider should render.
+    /// Set when user scrolls away from bottom during streaming.
+    pub unseen_from_line: Option<usize>,
+    /// Count of unseen messages since user scrolled away.
+    pub unseen_message_count: usize,
+    /// Pending permission request overlay.
+    pub permission_request: Option<PermissionRequest>,
+    /// Cached rendered lines for virtual scroll optimization.
+    pub cached_render: Option<CachedRender>,
+    /// Generation counter — bumped on every message mutation.
+    pub message_gen: usize,
+    /// Whether running in fullscreen (alt-screen) mode.
+    #[allow(dead_code)]
+    pub fullscreen: bool,
+    /// Typeahead prediction text shown dimmed in input bar.
+    pub typeahead: Option<String>,
+    /// Configurable keybindings (action → key chord).
+    #[allow(dead_code)]
+    pub keybindings: super::keybindings::KeybindingMap,
+    /// Tick count when Ctrl+C was last pressed (for double-tap quit).
+    pub last_ctrl_c_tick: Option<usize>,
 }
 
 impl AppState {
@@ -225,6 +276,8 @@ impl AppState {
         input.set_cursor_line_style(ratatui::style::Style::default());
         input.set_placeholder_text(" ");
         let terminal_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+        let keybindings = super::keybindings::load_keybindings();
+        let fullscreen = std::env::var("STRANDS_NO_FULLSCREEN").map(|v| v != "1").unwrap_or(true);
         Self {
             messages: Vec::new(),
             scroll_offset: 0,
@@ -247,7 +300,22 @@ impl AppState {
             mcp_servers,
             mcp_status: McpStatus::Loading,
             selection: Selection::default(),
+            vim_mode: VimMode::Off,
+            unseen_from_line: None,
+            unseen_message_count: 0,
+            permission_request: None,
+            cached_render: None,
+            message_gen: 0,
+            fullscreen,
+            typeahead: None,
+            keybindings,
+            last_ctrl_c_tick: None,
         }
+    }
+
+    /// Bump the message generation counter and invalidate render cache.
+    pub fn invalidate_cache(&mut self) {
+        self.message_gen = self.message_gen.wrapping_add(1);
     }
 }
 
@@ -326,6 +394,7 @@ impl TuiApp {
                     let mut msg = ChatMessage::assistant_empty();
                     msg.append_text(&text);
                     self.state.messages.push(msg);
+                    self.state.invalidate_cache();
                     self.state.auto_scroll = true;
                     self.state.scroll_offset = 0;
                     self.reset_input();
@@ -368,6 +437,7 @@ impl TuiApp {
                     let mut msg = ChatMessage::assistant_empty();
                     msg.append_text(&format!("Unknown command: /{}. Type /help for available commands.", name));
                     self.state.messages.push(msg);
+                    self.state.invalidate_cache();
                     self.state.auto_scroll = true;
                     self.state.scroll_offset = 0;
                     self.reset_input();
@@ -471,6 +541,7 @@ impl TuiApp {
                 let mut msg = ChatMessage::assistant_empty();
                 msg.append_text(&text);
                 self.state.messages.push(msg);
+                self.state.invalidate_cache();
                 self.state.auto_scroll = true;
                 self.state.scroll_offset = 0;
                 self.reset_input();
@@ -712,17 +783,25 @@ impl TuiApp {
             Event::AgentTextDelta(text) => {
                 if let Some(msg) = last_msg {
                     msg.append_text(&text);
+                    self.state.invalidate_cache();
+                    // Track unseen messages when user scrolled away
+                    if !self.state.auto_scroll {
+                        self.state.unseen_message_count = self.state.unseen_message_count.saturating_add(0);
+                        if self.state.unseen_from_line.is_none() {
+                            self.state.unseen_from_line = Some(self.state.total_lines as usize);
+                        }
+                    }
                 }
             }
             Event::AgentToolStart { name } => {
                 if let Some(msg) = last_msg {
                     msg.add_tool_call(name, String::new(), ToolCallStatus::Running);
+                    self.state.invalidate_cache();
                 }
             }
             Event::AgentToolCall { name, input } => {
                 let summary = crate::repl::tool_call_summary(&name, &input);
                 if let Some(msg) = last_msg {
-                    // Update the last tool call block with the summary
                     for block in msg.blocks.iter_mut().rev() {
                         if let ContentBlock::ToolCall {
                             summary: ref mut s, ..
@@ -732,6 +811,7 @@ impl TuiApp {
                             break;
                         }
                     }
+                    self.state.invalidate_cache();
                 }
             }
             Event::AgentToolResult { status, content } => {
@@ -741,7 +821,6 @@ impl TuiApp {
                     } else {
                         ToolCallStatus::Error
                     };
-                    // For errors, show the error reason in the summary
                     if new_status == ToolCallStatus::Error && !content.is_empty() {
                         for block in msg.blocks.iter_mut().rev() {
                             if let ContentBlock::ToolCall {
@@ -754,17 +833,24 @@ impl TuiApp {
                         }
                     }
                     msg.set_last_tool_status(new_status);
+                    self.state.invalidate_cache();
                 }
             }
             Event::AgentDone => {
                 self.state.agent_status = AgentStatus::Idle;
                 self.state.cancel_agent = None;
                 self.agent.reset_cancel();
+                self.state.invalidate_cache();
+                // Bump unseen count for completed turn
+                if !self.state.auto_scroll && self.state.unseen_from_line.is_some() {
+                    self.state.unseen_message_count = self.state.unseen_message_count.saturating_add(1);
+                }
             }
             Event::AgentError(e) => {
                 self.state.agent_status = AgentStatus::Error(e.clone());
                 if let Some(msg) = last_msg {
                     msg.append_text(&format!("\n[Error: {}]", e));
+                    self.state.invalidate_cache();
                 }
             }
             _ => {}

@@ -118,6 +118,9 @@ pub fn render_input(state: &mut AppState, frame: &mut Frame, area: Rect) {
 
     // Render inline argument hint
     render_argument_hint(state, frame, area, prompt_width);
+
+    // Render typeahead prediction (dimmed, after cursor)
+    render_typeahead(state, frame, area, prompt_width);
 }
 
 /// Render a dimmed argument hint inline after the cursor when typing a slash command.
@@ -172,6 +175,47 @@ fn render_argument_hint(state: &AppState, frame: &mut Frame, area: Rect, prompt_
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(hint_widget, hint_area);
+}
+
+/// Render a dimmed typeahead prediction inline after the cursor.
+/// Mirrors Claude Code's speculation/typeahead feature.
+fn render_typeahead(state: &AppState, frame: &mut Frame, area: Rect, prompt_width: u16) {
+    let prediction = match &state.typeahead {
+        Some(t) if !t.is_empty() => t,
+        _ => return,
+    };
+
+    // Don't show typeahead if there's already an argument hint
+    let text = state.input.lines().join("\n");
+    if text.trim_start().starts_with('/') && text.ends_with(' ') {
+        return;
+    }
+
+    let inner_x = area.x + prompt_width;
+    let inner_width = area.width.saturating_sub(prompt_width);
+    let text_len = text.len() as u16;
+
+    if text_len >= inner_width {
+        return;
+    }
+
+    let hint_x = inner_x + text_len;
+    let hint_width = inner_width.saturating_sub(text_len);
+    let hint_area = Rect::new(hint_x, area.y + 1, hint_width, 1);
+
+    // Truncate prediction to fit
+    let max_len = hint_width as usize;
+    let display = if prediction.len() > max_len {
+        &prediction[..max_len]
+    } else {
+        prediction.as_str()
+    };
+
+    let widget = Paragraph::new(Span::styled(
+        display,
+        Style::default().fg(Color::Rgb(80, 80, 80)),
+    ));
+    frame.render_widget(widget, hint_area);
 }
 
 /// Process a key event for the input bar. Returns true if the key was consumed.
@@ -259,4 +303,115 @@ fn replace_textarea_content(state: &mut AppState, text: &str) {
 pub enum InputAction {
     Submit,
     Consumed,
+}
+
+/// Handle vim Normal mode keys. Returns true if the key was consumed.
+pub fn handle_vim_normal_key(state: &mut AppState, key: KeyEvent) -> InputAction {
+    use crate::tui::app::VimMode;
+
+    match (key.modifiers, key.code) {
+        // Enter insert mode
+        (KeyModifiers::NONE, KeyCode::Char('i')) => {
+            state.vim_mode = VimMode::Insert;
+            InputAction::Consumed
+        }
+        // Append (enter insert after cursor)
+        (KeyModifiers::NONE, KeyCode::Char('a')) => {
+            state.vim_mode = VimMode::Insert;
+            // Move cursor right one position
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // Append at end of line
+        (KeyModifiers::SHIFT, KeyCode::Char('A')) => {
+            state.vim_mode = VimMode::Insert;
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // Insert at beginning of line
+        (KeyModifiers::SHIFT, KeyCode::Char('I')) => {
+            state.vim_mode = VimMode::Insert;
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // Navigation: hjkl
+        (KeyModifiers::NONE, KeyCode::Char('h')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        (KeyModifiers::NONE, KeyCode::Char('l')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        (KeyModifiers::NONE, KeyCode::Char('j')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // Word forward
+        (KeyModifiers::NONE, KeyCode::Char('w')) => {
+            // Move to next word boundary using Ctrl+Right
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            ));
+            InputAction::Consumed
+        }
+        // Word backward
+        (KeyModifiers::NONE, KeyCode::Char('b')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            ));
+            InputAction::Consumed
+        }
+        // Beginning of line
+        (KeyModifiers::NONE, KeyCode::Char('0')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // End of line
+        (KeyModifiers::NONE, KeyCode::Char('$')) | (KeyModifiers::SHIFT, KeyCode::Char('$')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // Delete character under cursor
+        (KeyModifiers::NONE, KeyCode::Char('x')) => {
+            state.input.input(crossterm::event::Event::Key(
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            ));
+            InputAction::Consumed
+        }
+        // dd — delete entire line (clear input)
+        (KeyModifiers::NONE, KeyCode::Char('d')) => {
+            let mut new_input = tui_textarea::TextArea::default();
+            new_input.set_cursor_line_style(ratatui::style::Style::default());
+            new_input.set_placeholder_text(" ");
+            state.input = new_input;
+            InputAction::Consumed
+        }
+        // Enter on Enter key (submit)
+        (KeyModifiers::NONE, KeyCode::Enter) => InputAction::Submit,
+        // Ignore everything else in Normal mode
+        _ => InputAction::Consumed,
+    }
 }

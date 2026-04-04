@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod event;
+pub mod keybindings;
 pub mod render;
 pub mod terminal;
 pub mod widgets;
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyModifiers};
 use strands::Agent;
 
-use self::app::{AgentStatus, TuiApp};
+use self::app::{AgentStatus, TuiApp, VimMode};
 use self::event::Event;
 use self::terminal::Tui;
 use self::widgets::input_bar::{self, InputAction};
@@ -34,8 +35,9 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
         original_hook(panic_info);
     }));
 
+    let fullscreen = std::env::var("STRANDS_NO_FULLSCREEN").map(|v| v != "1").unwrap_or(true);
     let mut tui = Tui::new(12.0, 30.0).map_err(|e| strands::Error::Configuration(e.to_string()))?;
-    tui.enter().map_err(|e| strands::Error::Configuration(e.to_string()))?;
+    tui.enter_with_fullscreen(fullscreen).map_err(|e| strands::Error::Configuration(e.to_string()))?;
 
     let mut app = TuiApp::new(agent, model_name, command_registry);
     let mut event_rx = tui.event_rx.take().unwrap();
@@ -136,6 +138,9 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
             if app.state.scroll_offset <= 3 {
                 app.state.scroll_offset = 0;
                 app.state.auto_scroll = true;
+                // Clear unseen divider when scrolling back to bottom
+                app.state.unseen_from_line = None;
+                app.state.unseen_message_count = 0;
             } else {
                 app.state.scroll_offset = app.state.scroll_offset.saturating_sub(3);
             }
@@ -181,29 +186,149 @@ fn copy_to_clipboard_osc52(text: &str) {
     let _ = std::io::stderr().flush();
 }
 
+/// Handle Ctrl+C: cancel streaming on first press, quit on double-press.
+/// Tick rate is 12 Hz, so 24 ticks ≈ 2 seconds.
+const CTRL_C_DOUBLE_TAP_TICKS: usize = 24;
+
+fn handle_ctrl_c(app: &mut TuiApp) {
+    // If streaming, first Ctrl+C always cancels the agent
+    if matches!(app.state.agent_status, AgentStatus::Streaming) {
+        if let Some(ref a) = app.state.cancel_agent {
+            a.cancel();
+        }
+        app.state.agent_status = AgentStatus::Idle;
+        app.state.cancel_agent = None;
+        app.state.last_ctrl_c_tick = Some(app.state.tick_count);
+        return;
+    }
+
+    // If input has text, first Ctrl+C clears it
+    let has_input = !app.state.input.lines().join("").trim().is_empty();
+    if has_input {
+        app.reset_input();
+        app.state.last_ctrl_c_tick = Some(app.state.tick_count);
+        return;
+    }
+
+    // Double Ctrl+C within the window → quit
+    if let Some(last_tick) = app.state.last_ctrl_c_tick {
+        if app.state.tick_count.wrapping_sub(last_tick) <= CTRL_C_DOUBLE_TAP_TICKS {
+            app.state.should_quit = true;
+            return;
+        }
+    }
+
+    // First Ctrl+C when idle with empty input → record and show hint
+    app.state.last_ctrl_c_tick = Some(app.state.tick_count);
+}
+
 fn handle_key(
     app: &mut TuiApp,
     key: crossterm::event::KeyEvent,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
 ) {
+    // --- Permission request overlay intercepts all keys ---
+    if app.state.permission_request.is_some() {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('y')) => {
+                if let Some(ref mut req) = app.state.permission_request {
+                    req.decision = Some(true);
+                }
+                app.state.permission_request = None;
+            }
+            (KeyModifiers::NONE, KeyCode::Char('n')) => {
+                if let Some(ref mut req) = app.state.permission_request {
+                    req.decision = Some(false);
+                }
+                app.state.permission_request = None;
+            }
+            (KeyModifiers::NONE, KeyCode::Char('a')) => {
+                // "Always allow" — allow + could store preference
+                if let Some(ref mut req) = app.state.permission_request {
+                    req.decision = Some(true);
+                }
+                app.state.permission_request = None;
+            }
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                // Deny on Esc
+                if let Some(ref mut req) = app.state.permission_request {
+                    req.decision = Some(false);
+                }
+                app.state.permission_request = None;
+            }
+            _ => {} // Ignore all other keys during permission prompt
+        }
+        return;
+    }
+
+    // --- Toggle vim mode (Ctrl+V) ---
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('v') {
+        app.state.vim_mode = match app.state.vim_mode {
+            VimMode::Off => VimMode::Normal,
+            VimMode::Normal | VimMode::Insert => VimMode::Off,
+        };
+        return;
+    }
+
+    // --- Vim Normal mode key handling ---
+    if app.state.vim_mode == VimMode::Normal {
+        match (key.modifiers, key.code) {
+            // Esc stays in Normal mode (no-op)
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                if !app.state.suggestions.is_empty() {
+                    app.state.suggestions.clear();
+                    app.state.selected_suggestion = -1;
+                } else if matches!(app.state.agent_status, AgentStatus::Streaming) {
+                    if let Some(ref a) = app.state.cancel_agent {
+                        a.cancel();
+                    }
+                    app.state.agent_status = AgentStatus::Idle;
+                    app.state.cancel_agent = None;
+                }
+                return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                handle_ctrl_c(app);
+                return;
+            }
+            _ => {}
+        }
+
+        // Delegate to vim normal mode handler
+        match input_bar::handle_vim_normal_key(&mut app.state, key) {
+            InputAction::Submit => {
+                let is_idle = matches!(app.state.agent_status, AgentStatus::Idle | AgentStatus::Error(_));
+                let is_streaming = matches!(app.state.agent_status, AgentStatus::Streaming);
+                if is_idle {
+                    app.submit(event_tx);
+                } else if is_streaming {
+                    app.try_immediate_command();
+                }
+            }
+            InputAction::Consumed => {}
+        }
+        return;
+    }
+
+    // --- Vim Insert mode: Esc returns to Normal ---
+    if app.state.vim_mode == VimMode::Insert {
+        if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
+            app.state.vim_mode = VimMode::Normal;
+            return;
+        }
+        // Fall through to normal key handling below
+    }
+
+    // --- Standard key handling (vim off or vim insert mode) ---
     match (key.modifiers, key.code) {
         // Quit or cancel streaming
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-            if matches!(app.state.agent_status, AgentStatus::Streaming) {
-                if let Some(ref a) = app.state.cancel_agent {
-                    a.cancel();
-                }
-                app.state.agent_status = AgentStatus::Idle;
-                app.state.cancel_agent = None;
-            } else {
-                app.state.should_quit = true;
-            }
+            handle_ctrl_c(app);
         }
 
         // Escape — dismiss suggestions or cancel streaming
         (KeyModifiers::NONE, KeyCode::Esc) => {
             if !app.state.suggestions.is_empty() {
-                // Dismiss autocomplete dropdown (mirrors Claude Code's autocomplete:dismiss)
                 app.state.suggestions.clear();
                 app.state.selected_suggestion = -1;
             } else if matches!(app.state.agent_status, AgentStatus::Streaming) {
@@ -224,12 +349,15 @@ fn handle_key(
             if app.state.scroll_offset <= 10 {
                 app.state.scroll_offset = 0;
                 app.state.auto_scroll = true;
+                // Clear unseen divider when scrolling back to bottom
+                app.state.unseen_from_line = None;
+                app.state.unseen_message_count = 0;
             } else {
                 app.state.scroll_offset = app.state.scroll_offset.saturating_sub(10);
             }
         }
 
-        // Mouse scroll via arrow keys with shift
+        // Shift+Arrow scroll
         (KeyModifiers::SHIFT, KeyCode::Up) => {
             app.state.auto_scroll = false;
             app.state.scroll_offset = app.state.scroll_offset.saturating_add(1);
@@ -238,37 +366,39 @@ fn handle_key(
             if app.state.scroll_offset <= 1 {
                 app.state.scroll_offset = 0;
                 app.state.auto_scroll = true;
+                app.state.unseen_from_line = None;
+                app.state.unseen_message_count = 0;
             } else {
                 app.state.scroll_offset = app.state.scroll_offset.saturating_sub(1);
             }
         }
 
-        // Tab — accept autocomplete suggestion (mirrors Claude Code's autocomplete:accept)
+        // Tab — accept autocomplete suggestion or typeahead
         (KeyModifiers::NONE, KeyCode::Tab) => {
             if !app.state.suggestions.is_empty() {
                 app.accept_suggestion();
-                // Re-trigger suggestions for the new input (e.g., "/clear " → no suggestions)
                 app.update_suggestions();
+            } else if let Some(prediction) = app.state.typeahead.take() {
+                // Accept typeahead prediction
+                for ch in prediction.chars() {
+                    app.state.input.insert_char(ch);
+                }
             }
         }
 
-        // All other keys go to input bar.
-        // When streaming, only allow immediate slash commands (mirrors Claude Code's
-        // handlePromptSubmit fast-path for `immediate: true` local-jsx commands).
+        // All other keys go to input bar
         _ => {
             let is_idle = matches!(app.state.agent_status, AgentStatus::Idle | AgentStatus::Error(_));
             let is_streaming = matches!(app.state.agent_status, AgentStatus::Streaming);
             let has_suggestions = !app.state.suggestions.is_empty();
 
             if is_idle || is_streaming {
-                // When suggestions are visible, intercept Up/Down for navigation
-                // (mirrors Claude Code's autocomplete:previous / autocomplete:next)
                 if has_suggestions {
                     match key.code {
                         KeyCode::Up => {
                             let len = app.state.suggestions.len() as i32;
                             app.state.selected_suggestion = if app.state.selected_suggestion <= 0 {
-                                len - 1 // wrap to bottom
+                                len - 1
                             } else {
                                 app.state.selected_suggestion - 1
                             };
@@ -278,7 +408,7 @@ fn handle_key(
                             let len = app.state.suggestions.len() as i32;
                             app.state.selected_suggestion =
                                 if app.state.selected_suggestion >= len - 1 {
-                                    0 // wrap to top
+                                    0
                                 } else {
                                     app.state.selected_suggestion + 1
                                 };
@@ -291,12 +421,10 @@ fn handle_key(
                 match input_bar::handle_input_key(&mut app.state, key) {
                     InputAction::Submit => {
                         if has_suggestions && app.state.selected_suggestion >= 0 {
-                            // If a model suggestion is selected, switch model directly
                             if let Some(model_id) = app.selected_model_id() {
                                 app.reset_input();
                                 app.switch_model(model_id, event_tx.clone());
                             } else {
-                                // Enter with suggestions visible: accept and submit
                                 app.accept_suggestion();
                                 app.submit(event_tx);
                             }
@@ -307,13 +435,39 @@ fn handle_key(
                         }
                     }
                     InputAction::Consumed => {
-                        // After every keystroke, update suggestions
+                        // Clear typeahead on any keystroke
+                        app.state.typeahead = None;
+                        // Update suggestions
                         if is_idle {
                             app.update_suggestions();
+                            // Generate simple typeahead predictions
+                            update_typeahead(&mut app.state);
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Generate simple typeahead predictions based on input history.
+/// Mirrors Claude Code's speculation/promptSuggestion infrastructure.
+fn update_typeahead(state: &mut app::AppState) {
+    let text = state.input.lines().join("\n");
+    let trimmed = text.trim();
+
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        state.typeahead = None;
+        return;
+    }
+
+    // Simple prefix match against input history
+    for hist in state.input_history.iter().rev() {
+        if hist.starts_with(trimmed) && hist.len() > trimmed.len() {
+            state.typeahead = Some(hist[trimmed.len()..].to_string());
+            return;
+        }
+    }
+
+    state.typeahead = None;
 }

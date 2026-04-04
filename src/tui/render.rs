@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::Frame;
 
 use super::app::AppState;
-use super::widgets::{input_bar, messages, status_bar, suggestions};
+use super::widgets::{input_bar, messages, permission, status_bar, suggestions};
 
 pub fn view(frame: &mut Frame, state: &mut AppState) {
     let terminal_height = frame.area().height;
@@ -42,4 +42,9 @@ pub fn view(frame: &mut Frame, state: &mut AppState) {
     }
     input_bar::render_input(state, frame, chunks[3]);
     status_bar::render_status_bar(state, frame, chunks[4]);
+
+    // Permission request overlay (renders on top of everything)
+    if let Some(ref request) = state.permission_request {
+        permission::render_permission_overlay(request, frame, frame.area());
+    }
 }

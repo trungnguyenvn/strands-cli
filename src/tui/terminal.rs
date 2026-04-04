@@ -27,6 +27,8 @@ pub struct Tui {
     pub event_tx: UnboundedSender<Event>,
     pub frame_rate: f64,
     pub tick_rate: f64,
+    /// Whether running in fullscreen (alt-screen) mode.
+    pub fullscreen: bool,
 }
 
 impl Tui {
@@ -44,6 +46,7 @@ impl Tui {
             event_tx,
             frame_rate,
             tick_rate,
+            fullscreen: true,
         })
     }
 
@@ -95,15 +98,29 @@ impl Tui {
         });
     }
 
-    pub fn enter(&mut self) -> io::Result<()> {
+    /// Enter the TUI. If `fullscreen` is true, uses alternate screen.
+    /// If false, stays in the normal terminal (no alt-screen) — mirrors Claude Code's
+    /// non-fullscreen mode.
+    pub fn enter_with_fullscreen(&mut self, fullscreen: bool) -> io::Result<()> {
+        self.fullscreen = fullscreen;
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
-            io::stderr(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-            cursor::Hide
-        )?;
+        if fullscreen {
+            crossterm::execute!(
+                io::stderr(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste,
+                cursor::Hide
+            )?;
+        } else {
+            // Non-fullscreen: no alt-screen, but still enable mouse + paste + hide cursor
+            crossterm::execute!(
+                io::stderr(),
+                EnableMouseCapture,
+                EnableBracketedPaste,
+                cursor::Hide
+            )?;
+        }
         self.start();
         Ok(())
     }
@@ -112,13 +129,22 @@ impl Tui {
         self.cancel();
         if crossterm::terminal::is_raw_mode_enabled()? {
             self.flush()?;
-            crossterm::execute!(
-                io::stderr(),
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                LeaveAlternateScreen,
-                cursor::Show
-            )?;
+            if self.fullscreen {
+                crossterm::execute!(
+                    io::stderr(),
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen,
+                    cursor::Show
+                )?;
+            } else {
+                crossterm::execute!(
+                    io::stderr(),
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    cursor::Show
+                )?;
+            }
             crossterm::terminal::disable_raw_mode()?;
         }
         Ok(())
