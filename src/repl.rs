@@ -253,16 +253,31 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
         match stream_turn(agent, &agent_prompt).await {
             Ok(did_exit_plan) => {
                 if did_exit_plan {
-                    // Set system context for next turn with plan file reference
+                    // Set implementation prompt for next turn (matches Claude Code's
+                    // "Implement the following plan:" initialMessage with clearContext)
                     let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
-                    pending_system_reminder = Some(format!(
-                        "<system-reminder>\n\
-                         ## Exited Plan Mode\n\n\
-                         You have exited plan mode. You can now make edits, run tools, and take actions. \
-                         The plan file is located at {} if you need to reference it.\n\
-                         </system-reminder>",
-                        plan_file.display()
-                    ));
+                    let plan_content = std::fs::read_to_string(&plan_file).unwrap_or_default();
+                    if !plan_content.trim().is_empty() {
+                        pending_system_reminder = Some(format!(
+                            "<system-reminder>\n\
+                             ## Exited Plan Mode\n\n\
+                             You have exited plan mode. You can now make edits, run tools, and take actions.\n\
+                             The plan file is located at {} if you need to reference it.\n\
+                             </system-reminder>\n\n\
+                             Implement the following plan:\n\n{}",
+                            plan_file.display(),
+                            plan_content.trim()
+                        ));
+                    } else {
+                        pending_system_reminder = Some(format!(
+                            "<system-reminder>\n\
+                             ## Exited Plan Mode\n\n\
+                             You have exited plan mode. You can now make edits, run tools, and take actions.\n\
+                             The plan file is located at {} if you need to reference it.\n\
+                             </system-reminder>",
+                            plan_file.display()
+                        ));
+                    }
                 }
             }
             Err(e) => {

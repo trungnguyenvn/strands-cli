@@ -2736,3 +2736,96 @@ fn harness_esc_cancel_does_not_affect_scroll() {
     h.press_esc();
     assert!(h.app.state.auto_scroll);
 }
+
+// ===========================================================================
+// Session suggestions
+// ===========================================================================
+
+/// Helper: create a temp session JSONL file so session suggestions have data.
+fn create_test_session(dir: &std::path::Path, session_id: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{session_id}.jsonl"));
+    std::fs::write(
+        &path,
+        // Minimal valid journal: one session_meta + one message entry
+        format!(
+            r#"{{"type":"session_meta","session_id":"{session_id}","version":1}}"#
+        ) + "\n" + &format!(
+            r#"{{"type":"message","uuid":"00000000-0000-0000-0000-000000000001","parent_uuid":null,"role":"user","content":[{{"type":"text","text":"hello"}}],"timestamp":"2026-04-04T00:00:00Z"}}"#
+        ) + "\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn generate_suggestions_resume_space_shows_sessions() {
+    let cwd = std::env::current_dir().unwrap();
+    let dir = crate::session::SessionId::storage_dir(&cwd);
+    let test_id = "test-suggestion-sess-002";
+    create_test_session(&dir, test_id);
+
+    let registry = crate::commands::builtin_registry();
+    let suggestions = crate::commands::generate_suggestions("/resume ", &registry, "test-model");
+
+    assert!(
+        suggestions.iter().any(|s| s.session_id.as_deref() == Some(test_id)),
+        "/resume (space) should show session '{}', got: {:?}",
+        test_id,
+        suggestions.iter().map(|s| (&s.name, &s.session_id)).collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_file(dir.join(format!("{test_id}.jsonl")));
+}
+
+#[test]
+fn harness_resume_tab_shows_session_suggestions() {
+    let cwd = std::env::current_dir().unwrap();
+    let dir = crate::session::SessionId::storage_dir(&cwd);
+    let test_id = "test-harness-sess-004";
+    create_test_session(&dir, test_id);
+
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("/resume");
+    // Tab accepts the "/resume" command suggestion and triggers update_suggestions
+    h.press_tab();
+    assert!(
+        h.input_text().starts_with("/resume "),
+        "Tab should accept to '/resume ', got: '{}'",
+        h.input_text()
+    );
+    assert!(
+        h.app.state.suggestions.iter().any(|s| s.session_id.is_some()),
+        "After Tab on /resume, suggestions should show sessions, got: {:?}",
+        h.app.state.suggestions.iter().map(|s| (&s.name, &s.session_id)).collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_file(dir.join(format!("{test_id}.jsonl")));
+}
+
+#[test]
+fn harness_select_session_suggestion_sets_session_id() {
+    let cwd = std::env::current_dir().unwrap();
+    let dir = crate::session::SessionId::storage_dir(&cwd);
+    let test_id = "test-harness-sess-005";
+    create_test_session(&dir, test_id);
+
+    let mut h = TestHarness::new(80, 24);
+    // Type /resume to get session suggestions
+    h.type_str("/resume");
+    assert!(!h.app.state.suggestions.is_empty(), "should have suggestions");
+
+    // Find the test session in suggestions and select it
+    if let Some(idx) = h.app.state.suggestions.iter().position(|s| s.session_id.as_deref() == Some(test_id)) {
+        h.app.state.selected_suggestion = idx as i32;
+        let selected = h.app.selected_session_id();
+        assert_eq!(
+            selected.as_deref(),
+            Some(test_id),
+            "selected_session_id should return the full session ID"
+        );
+    } else {
+        panic!("Test session not found in suggestions");
+    }
+
+    let _ = std::fs::remove_file(dir.join(format!("{test_id}.jsonl")));
+}

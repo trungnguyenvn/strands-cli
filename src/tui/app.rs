@@ -1254,15 +1254,29 @@ impl TuiApp {
                     self.state.scroll_offset = 0;
                 }
 
-                // Prepare system context for next turn: inject plan as implementation instructions
-                self.state.pending_system_reminder = Some(format!(
-                    "<system-reminder>\n\
-                     ## Exited Plan Mode\n\n\
-                     You have exited plan mode. You can now make edits, run tools, and take actions. \
-                     The plan file is located at {} if you need to reference it.\n\
-                     </system-reminder>",
-                    plan_file.display()
-                ));
+                // Prepare implementation prompt for next turn (matches Claude Code's
+                // "Implement the following plan:" initialMessage with clearContext).
+                if !plan_content.trim().is_empty() {
+                    self.state.pending_system_reminder = Some(format!(
+                        "<system-reminder>\n\
+                         ## Exited Plan Mode\n\n\
+                         You have exited plan mode. You can now make edits, run tools, and take actions.\n\
+                         The plan file is located at {} if you need to reference it.\n\
+                         </system-reminder>\n\n\
+                         Implement the following plan:\n\n{}",
+                        plan_file.display(),
+                        plan_content.trim()
+                    ));
+                } else {
+                    self.state.pending_system_reminder = Some(format!(
+                        "<system-reminder>\n\
+                         ## Exited Plan Mode\n\n\
+                         You have exited plan mode. You can now make edits, run tools, and take actions.\n\
+                         The plan file is located at {} if you need to reference it.\n\
+                         </system-reminder>",
+                        plan_file.display()
+                    ));
+                }
             }
             Event::AgentDone => {
                 self.state.agent_status = AgentStatus::Idle;

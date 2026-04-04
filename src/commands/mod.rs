@@ -1190,27 +1190,24 @@ pub struct SuggestionItem {
 /// Generate command suggestions for a partial input.
 /// When the input is `/model ` (with trailing space), returns model choices as suggestions.
 pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_model: &str) -> Vec<SuggestionItem> {
-    let trimmed = input.trim();
-
-    // Empty input: show recent sessions as quick-resume suggestions
-    if trimmed.is_empty() {
-        return generate_session_suggestions("");
-    }
+    let trimmed = input.trim_start();
 
     if !trimmed.starts_with('/') {
         return Vec::new();
     }
 
-    // Check if this is a `/model <partial>` or `/resume <partial>` input
+    // `/resume` (with or without space) — show session picker immediately
+    if trimmed == "/resume" || trimmed.starts_with("/resume ") {
+        let query = trimmed.strip_prefix("/resume").unwrap_or("").trim().to_lowercase();
+        return generate_session_suggestions(&query);
+    }
+
+    // Check if this is a `/model <partial>` input
     if let Some(space_idx) = trimmed.find(' ') {
         let cmd_name = &trimmed[1..space_idx];
         if cmd_name == "model" {
             let query = trimmed[space_idx + 1..].trim().to_lowercase();
             return generate_model_suggestions(&query, current_model);
-        }
-        if cmd_name == "resume" {
-            let query = trimmed[space_idx + 1..].trim().to_lowercase();
-            return generate_session_suggestions(&query);
         }
         // For other commands, don't show suggestions if there are real arguments
         if !trimmed[space_idx + 1..].trim().is_empty() {
