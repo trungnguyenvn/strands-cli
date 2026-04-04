@@ -122,6 +122,22 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
     spans.push(sep.clone());
     spans.push(model);
 
+    // Context window usage — always shown when available (matching Claude Code)
+    if let Some(pct) = state.context_percent_used {
+        let color = if state.context_critical {
+            Color::Red
+        } else if state.context_warning {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        spans.push(sep.clone());
+        spans.push(Span::styled(
+            format!("ctx {:.0}%", pct),
+            Style::default().fg(color),
+        ));
+    }
+
     if state.session_id.is_some() {
         spans.push(sep.clone());
         spans.push(session_span);
@@ -135,21 +151,6 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
     if state.turn_count > 0 {
         spans.push(sep.clone());
         spans.push(turn_info);
-    }
-
-    // Context window usage indicator (matching Claude Code)
-    if let Some(pct) = state.context_percent_used {
-        if pct > 50.0 {
-            let (color, label) = if state.context_critical {
-                (Color::Red, format!("ctx {:.0}%", pct))
-            } else if state.context_warning {
-                (Color::Yellow, format!("ctx {:.0}%", pct))
-            } else {
-                (Color::DarkGray, format!("ctx {:.0}%", pct))
-            };
-            spans.push(sep.clone());
-            spans.push(Span::styled(label, Style::default().fg(color)));
-        }
     }
 
     if !state.auto_scroll && state.total_lines > 0 {
