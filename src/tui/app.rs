@@ -274,6 +274,10 @@ pub struct MessageCacheEntry {
     pub block_count: usize,
     pub text_len: usize,
     pub width: u16,
+    /// Cached visual line count from Paragraph word-wrapping at `wrap_width`.
+    pub wrapped_line_count: u16,
+    /// The width used to compute `wrapped_line_count`.
+    pub wrap_width: u16,
 }
 
 impl MessageCacheEntry {
@@ -283,6 +287,8 @@ impl MessageCacheEntry {
             block_count: msg.blocks.len(),
             text_len: msg_text_len(msg),
             width,
+            wrapped_line_count: 0,
+            wrap_width: 0,
         }
     }
 
@@ -1025,6 +1031,9 @@ impl TuiApp {
                 // Reset suppression flags for new plan session
                 self.state.plan_mode_enter_rejected = false;
                 self.state.plan_mode_exit_handled = false;
+                // Enable deferred mode — tools return success without mutating state,
+                // TUI handles actual transitions after user approval.
+                strands_tools::utility::plan_state::set_deferred(true);
                 // Store system-reminder for injection into next agent call
                 let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
                 let reminder = strands_tools::utility::plan_state::build_plan_mode_system_reminder(&plan_file);
@@ -1041,6 +1050,7 @@ impl TuiApp {
 
         // If leaving plan mode, exit cleanly
         if self.state.permission_mode == PermissionMode::Plan && new_mode != PermissionMode::Plan {
+            strands_tools::utility::plan_state::set_deferred(false);
             let _ = strands_tools::utility::plan_state::exit_plan_mode(None);
         }
 
@@ -1324,8 +1334,11 @@ impl TuiApp {
             PlanModeAction::ConfirmEnter => {
                 // Reset exit flag — new plan mode session starts
                 self.state.plan_mode_exit_handled = false;
+                // Enable deferred mode so ExitPlanMode tool returns success as no-op
+                strands_tools::utility::plan_state::set_deferred(false);
                 // Enter plan mode now (we undid the tool's side-effect in the event handler).
                 let _ = strands_tools::utility::plan_state::enter_plan_mode(None);
+                strands_tools::utility::plan_state::set_deferred(true);
                 self.state.permission_mode = PermissionMode::Plan;
 
                 let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
@@ -1345,6 +1358,8 @@ impl TuiApp {
                 self.send_to_agent("Yes, enter plan mode. Continue with planning.".to_string(), event_tx);
             }
             PlanModeAction::RejectEnter => {
+                // Disable deferred mode — not in plan mode anymore.
+                strands_tools::utility::plan_state::set_deferred(false);
                 // Plan mode was already undone in the event handler — just set UI mode.
                 self.state.permission_mode = PermissionMode::Default;
                 // Suppress future EnterPlanMode popups this session
@@ -1380,24 +1395,32 @@ impl TuiApp {
             PlanModeAction::KeepPlanning => {
                 // Reset exit flag — model will call ExitPlanMode again after revising
                 self.state.plan_mode_exit_handled = false;
-                // Plan mode was already restored by undo_exit_plan_mode in the event handler.
-                // Same plan file is preserved — no need to re-enter.
+                // Deferred mode stays on — ExitPlanMode will remain a no-op for the next cycle.
+                // Plan mode is still active (tool didn't mutate state).
                 self.state.permission_mode = PermissionMode::Plan;
 
-                // Set system reminder for the feedback turn
+                // Clear conversation history — the old history has a successful
+                // ExitPlanMode result which would confuse the model into thinking
+                // it already exited. In TypeScript, the tool never ran so the model
+                // receives an error tool_result. We simulate this by starting fresh.
+                self.agent.clear_history();
+
+                // Build full plan mode system-reminder (same as entering plan mode)
                 let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                let plan_content = self.state.pending_plan_content.as_deref().unwrap_or("");
+                let plan_reminder = strands_tools::utility::plan_state::build_plan_mode_system_reminder(&plan_file);
                 self.state.pending_system_reminder = Some(format!(
-                    "<system-reminder>\n\
-                     ## Back in Plan Mode\n\n\
-                     The user rejected your plan and wants changes. You are back in plan mode.\n\
-                     Update your plan at {} based on the user's feedback below.\n\
-                     When done, call ExitPlanMode again.\n\
-                     </system-reminder>",
-                    plan_file.display()
+                    "{}\n\n\
+                     ## Previous Plan (User Wants Changes)\n\n\
+                     The user rejected your previous plan below. Revise it based on their feedback.\n\
+                     Update the plan file at {} and call ExitPlanMode when ready.\n\n\
+                     Previous plan:\n{}\n",
+                    plan_reminder,
+                    plan_file.display(),
+                    plan_content.trim()
                 ));
 
                 // Let the user type feedback — don't auto-submit
-                // The input bar is now active for typing
             }
         }
     }
@@ -1406,6 +1429,9 @@ impl TuiApp {
     fn complete_plan_exit(&mut self, target_mode: PermissionMode) {
         let plan_file_path = self.state.pending_plan_file.take().unwrap_or_default();
         let plan_content = self.state.pending_plan_content.take().unwrap_or_default();
+
+        // Disable deferred mode so exit_plan_mode actually mutates state.
+        strands_tools::utility::plan_state::set_deferred(false);
 
         // Clear stale plan mode conversation context
         self.agent.clear_history();
@@ -1870,11 +1896,8 @@ impl TuiApp {
                 }
             }
             Event::EnterPlanModeRequested => {
-                // Undo the tool's side-effect immediately — matching TypeScript where
-                // the tool doesn't execute until user approves.
-                if strands_tools::utility::plan_state::is_in_plan_mode() {
-                    let _ = strands_tools::utility::plan_state::exit_plan_mode(None);
-                }
+                // In deferred mode, the tool returned success without mutating state.
+                // No undo needed.
 
                 if self.state.plan_mode_enter_rejected {
                     // User already rejected plan mode this session — don't ask again.
@@ -1901,10 +1924,8 @@ impl TuiApp {
                     return;
                 }
 
-                // Undo the tool's side-effect immediately — matching TypeScript where
-                // the tool doesn't execute until user approves. Re-enter plan mode
-                // with the same plan file so state is consistent during the popup.
-                let _ = strands_tools::utility::plan_state::undo_exit_plan_mode(&plan_file);
+                // In deferred mode, the tool returned success + plan content without
+                // mutating state. Plan mode is still active. No undo needed.
 
                 // Model has finished planning — show plan + inline suggestions for approval.
                 self.state.agent_status = AgentStatus::Idle;

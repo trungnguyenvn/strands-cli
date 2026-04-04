@@ -18,7 +18,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{
     AgentStatus, AppState, ChatMessage, ContentBlock, MessageCacheEntry, Role,
@@ -82,7 +81,7 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
                 state.tick_count,
                 width,
             );
-            let count = count_wrapped_lines(&lines, wrap_width);
+            let count = paragraph_line_count(&lines, wrap_width);
             line_counts.push(count);
             // Store in message_cache slot temporarily for Pass 2
             state.message_cache[i] = Some(MessageCacheEntry {
@@ -90,6 +89,8 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
                 block_count: 0,
                 text_len: 0,
                 width: 0, // fingerprint intentionally invalid so it's never reused as-is
+                wrapped_line_count: count,
+                wrap_width,
             });
         } else {
             // Check per-message cache validity
@@ -106,11 +107,13 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
                 ));
             }
 
-            let count = count_wrapped_lines(
-                &state.message_cache[i].as_ref().unwrap().lines,
-                wrap_width,
-            );
-            line_counts.push(count);
+            let entry = state.message_cache[i].as_mut().unwrap();
+            // Use cached wrapped line count if wrap_width hasn't changed
+            if entry.wrap_width != wrap_width {
+                entry.wrapped_line_count = paragraph_line_count(&entry.lines, wrap_width);
+                entry.wrap_width = wrap_width;
+            }
+            line_counts.push(entry.wrapped_line_count);
         }
     }
 
@@ -492,30 +495,18 @@ fn render_welcome(model_name: &str) -> Vec<Line<'static>> {
     ]
 }
 
-/// Count the number of visual (wrapped) lines for a set of logical lines at a given width.
-/// Paragraph with `Wrap { trim: false }` wraps lines at this width. We must use the
-/// wrapped count for scroll math — using logical count causes content to appear stuck
-/// behind the input on narrow terminals (mobile).
-fn count_wrapped_lines(lines: &[Line], wrap_width: u16) -> u16 {
-    if wrap_width == 0 {
+/// Count the number of visual (wrapped) lines using ratatui's own word-wrapping.
+///
+/// Previous implementation used character-level ceiling division which underestimates
+/// line count vs ratatui's word-boundary wrapping, causing the bottom of message
+/// history to be hidden behind the input box.
+pub fn paragraph_line_count(lines: &[Line], wrap_width: u16) -> u16 {
+    if wrap_width == 0 || lines.is_empty() {
         return lines.len() as u16;
     }
-    let w = wrap_width as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let line_width: usize = line
-                .spans
-                .iter()
-                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-                .sum();
-            if line_width <= w {
-                1u16
-            } else {
-                ((line_width + w - 1) / w) as u16
-            }
-        })
-        .sum()
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(wrap_width) as u16
 }
 
 /// Convert a ratatui Line to plain text for selection extraction.

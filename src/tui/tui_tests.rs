@@ -4103,3 +4103,62 @@ fn rewind_clears_same_caches_as_clear() {
     assert!(state.message_cache.is_empty(), "message_cache should be empty after rewind");
     assert!(state.streaming_md_cache.is_none(), "streaming_md_cache should be None after rewind");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: word-wrap line count must match ratatui Paragraph wrapping
+// ---------------------------------------------------------------------------
+//
+// Bug: count_wrapped_lines used character-level ceiling division (ceil(width/w))
+// but ratatui's Paragraph uses word-boundary wrapping which produces more lines.
+// This caused total_lines to be underestimated, so auto-scroll didn't scroll
+// far enough and bottom content was hidden behind the input box.
+
+#[test]
+fn word_wrap_line_count_matches_paragraph() {
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Wrap};
+    use super::widgets::messages::paragraph_line_count;
+
+    // "hello world tests" at width 10:
+    // Character-level: ceil(17/10) = 2 (WRONG)
+    // Word wrap: "hello " / "world " / "tests" = 3 (CORRECT)
+    let lines = vec![Line::from("hello world tests")];
+    let count = paragraph_line_count(&lines, 10);
+    let expected = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(10) as u16;
+    assert_eq!(count, expected, "paragraph_line_count should match ratatui");
+    assert_eq!(count, 3, "word wrap should produce 3 lines, not 2");
+}
+
+#[test]
+fn auto_scroll_shows_bottom_content_with_long_paragraphs() {
+    // Simulate a conversation with long paragraphs that trigger word wrapping
+    let width = 40u16;
+    let height = 20u16;
+    let mut state = make_state(width, height);
+
+    // Add a user message
+    state.messages.push(super::app::ChatMessage {
+        role: super::app::Role::User,
+        blocks: vec![super::app::ContentBlock::Text("test".to_string())],
+    });
+
+    // Add an assistant message with a long paragraph that will word-wrap
+    let long_text = "This is a very long paragraph that contains many words and will definitely need to be wrapped across multiple lines when displayed in a narrow terminal window of only forty characters wide.";
+    state.messages.push(super::app::ChatMessage {
+        role: super::app::Role::Assistant,
+        blocks: vec![super::app::ContentBlock::Text(long_text.to_string())],
+    });
+
+    // Render and check that the last line of the assistant message is visible
+    let buf = render_to_buffer(&mut state, width, height);
+    let lines = buffer_lines(&buf);
+
+    // The word "wide." should be visible (it's the last word of the message)
+    assert!(
+        buffer_contains(&buf, "wide"),
+        "Bottom of message should be visible with auto-scroll. Buffer:\n{}",
+        lines.join("\n")
+    );
+}
