@@ -86,6 +86,8 @@ pub enum CommandResult {
     },
     /// Resume a session by ID. The caller handles async loading.
     ResumeSession(String),
+    /// Open the session picker — set input to `/resume ` and show session suggestions.
+    SessionPicker,
 }
 
 // ---------------------------------------------------------------------------
@@ -602,25 +604,7 @@ fn format_command_line(cmd: &CommandInfo) -> String {
 fn cmd_resume(args: &str, _ctx: &CommandContext) -> CommandResult {
     let session_ref = args.trim();
     if session_ref.is_empty() {
-        // No argument: show session list (suggestions will appear as user types)
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let dir = crate::session::SessionId::storage_dir(&cwd);
-        let sessions = crate::session::list_sessions(&dir);
-        if sessions.is_empty() {
-            return CommandResult::Text("No sessions found. Start a conversation first.".to_string());
-        }
-        let mut lines = vec!["Type `/resume ` to see sessions as suggestions, or pick one:".to_string()];
-        for (i, s) in sessions.iter().take(10).enumerate() {
-            lines.push(format!(
-                "  {} — {} ({} KB, {})",
-                i + 1,
-                s.session_id,
-                s.size_bytes / 1024,
-                s.modified.format("%Y-%m-%d %H:%M"),
-            ));
-        }
-        lines.push("\nUse `/resume <session-id>` or `/resume latest`".to_string());
-        CommandResult::Text(lines.join("\n"))
+        CommandResult::SessionPicker
     } else {
         CommandResult::ResumeSession(session_ref.to_string())
     }

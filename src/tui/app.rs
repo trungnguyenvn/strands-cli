@@ -606,6 +606,11 @@ impl TuiApp {
                     self.update_suggestions();
                     return;
                 }
+                DispatchResult::Local(CommandResult::SessionPicker) => {
+                    self.set_input("/resume ");
+                    self.update_suggestions();
+                    return;
+                }
                 DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
                     self.reset_input();
                     self.switch_model(model_id, event_tx);

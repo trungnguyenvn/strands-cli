@@ -147,6 +147,44 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                     }
                     continue;
                 }
+                DispatchResult::Local(CommandResult::SessionPicker) => {
+                    // Plain REPL: list sessions and prompt for selection
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let dir = crate::session::SessionId::storage_dir(&cwd);
+                    let sessions = crate::session::list_sessions(&dir);
+                    if sessions.is_empty() {
+                        println!("No sessions found.");
+                    } else {
+                        for (i, s) in sessions.iter().take(10).enumerate() {
+                            println!("  {:2}) {} ({} KB, {})", i + 1, s.session_id, s.size_bytes / 1024, s.modified.format("%Y-%m-%d %H:%M"));
+                        }
+                        print!("\nSelect (1-{}) or Enter to cancel: ", sessions.len().min(10));
+                        io::stdout().flush().unwrap();
+                        let mut choice = String::new();
+                        if stdin.read_line(&mut choice).unwrap() > 0 {
+                            if let Ok(n) = choice.trim().parse::<usize>() {
+                                if n >= 1 && n <= sessions.len().min(10) {
+                                    let sid = &sessions[n - 1].session_id;
+                                    let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
+                                    match tokio::runtime::Handle::current().block_on(
+                                        crate::session::resolve_and_load(&sessions_dir, sid)
+                                    ) {
+                                        Ok((id, msgs)) => {
+                                            agent.clear_history();
+                                            for m in &msgs {
+                                                agent.add_message(m.clone());
+                                            }
+                                            message_count = msgs.len();
+                                            println!("{}", format!("Resumed session {} ({} messages)", id, msgs.len()).green());
+                                        }
+                                        Err(e) => eprintln!("{} {}", "error:".red().bold(), e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 DispatchResult::Local(CommandResult::ResumeSession(session_ref)) => {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
