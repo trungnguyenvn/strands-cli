@@ -812,27 +812,31 @@ impl TuiApp {
 
         // Save to input history (deduplicated)
         let trimmed = prompt.trim().to_string();
-        if !trimmed.starts_with('/') {
-            if self.state.input_history.last().map(|s| s.as_str()) != Some(trimmed.as_str()) {
-                self.state.input_history.push(trimmed);
-            }
+        if !trimmed.starts_with('/') && self.state.input_history.last().map(|s| s.as_str()) != Some(trimmed.as_str()) {
+            self.state.input_history.push(trimmed);
         }
         self.state.history_index = None;
         self.state.history_stash.clear();
         self.state.turn_count += 1;
 
-        // Record last prompt and git branch in session journal (fire-and-forget)
+        // Record last prompt and git branch in session journal (fire-and-forget).
+        // NOTE: JournalSessionManager uses parking_lot::RwLock whose guards are
+        // !Send, so we cannot use tokio::spawn. This function is sync, so we
+        // use block_in_place + block_on to run the async journal writes.
         if let Some(journal) = crate::session::get_journal() {
             let journal = std::sync::Arc::clone(journal);
             let prompt_text = prompt.clone();
-            tokio::spawn(async move {
-                let _ = journal.set_last_prompt(prompt_text).await;
-                // Record current git branch (matches TypeScript per-turn stamping)
-                if let Some(ctx) = crate::context::get_git_status(
-                    &std::env::current_dir().unwrap_or_default(),
-                ) {
-                    let _ = journal.set_git_branch(ctx.branch).await;
-                }
+            tokio::task::block_in_place(move || {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async move {
+                    let _ = journal.set_last_prompt(prompt_text).await;
+                    // Record current git branch (matches TypeScript per-turn stamping)
+                    if let Some(ctx) = crate::context::get_git_status(
+                        &std::env::current_dir().unwrap_or_default(),
+                    ) {
+                        let _ = journal.set_git_branch(ctx.branch).await;
+                    }
+                });
             });
         }
 
@@ -1756,17 +1760,14 @@ impl TuiApp {
             .count() + 1;
 
         // Restore files from snapshot
-        match strands_tools::file::file_history::rewind_to_snapshot(message_id) {
-            Ok(stats) => {
-                if stats.files_changed > 0 {
-                    result_lines.push(format!(
-                        "Restored {} file(s) ({} restored, {} deleted)",
-                        stats.files_changed, stats.files_restored, stats.files_deleted
-                    ));
-                }
+        if let Ok(stats) = strands_tools::file::file_history::rewind_to_snapshot(message_id) {
+            if stats.files_changed > 0 {
+                result_lines.push(format!(
+                    "Restored {} file(s) ({} restored, {} deleted)",
+                    stats.files_changed, stats.files_restored, stats.files_deleted
+                ));
             }
-            Err(_) => {} // No snapshot or no changes — that's fine
-        }
+        } // No snapshot or no changes — that's fine
 
         // Truncate conversation to just before the selected message
         self.state.messages.truncate(message_index);
@@ -1797,32 +1798,38 @@ impl TuiApp {
 
         // Write a rewind marker to the JSONL journal so that resume
         // reconstructs the post-rewind conversation (fixes Bug B).
+        // NOTE: JournalSessionManager uses parking_lot::RwLock whose guards are
+        // !Send, so we cannot use tokio::spawn. This function is sync, so we
+        // use tokio::task::block_in_place + block_on to run the async work.
         if let Some(journal) = crate::session::get_journal() {
             let journal = std::sync::Arc::clone(journal);
             let target_count = sdk_msg_count;
-            tokio::spawn(async move {
-                // Load the journal to find the UUID of the target message
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
-                let path = sessions_dir.join(format!("{}.jsonl", journal.session_id()));
-                if let Ok(loaded) = strands::session::journal_session_manager::load_journal(&path).await {
-                    // Find the UUID of the message at target_count - 1
-                    // (0-indexed: the last message to keep)
-                    let mut msg_idx = 0;
-                    let mut target_uuid = None;
-                    for (uuid, entry) in &loaded.messages {
-                        if let strands::types::journal::JournalEntry::Message { .. } = entry {
-                            msg_idx += 1;
-                            if msg_idx == target_count {
-                                target_uuid = Some(*uuid);
-                                break;
+            tokio::task::block_in_place(move || {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async move {
+                    // Load the journal to find the UUID of the target message
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
+                    let path = sessions_dir.join(format!("{}.jsonl", journal.session_id()));
+                    if let Ok(loaded) = strands::session::journal_session_manager::load_journal(&path).await {
+                        // Find the UUID of the message at target_count - 1
+                        // (0-indexed: the last message to keep)
+                        let mut msg_idx = 0;
+                        let mut target_uuid = None;
+                        for (uuid, entry) in &loaded.messages {
+                            if let strands::types::journal::JournalEntry::Message { .. } = entry {
+                                msg_idx += 1;
+                                if msg_idx == target_count {
+                                    target_uuid = Some(*uuid);
+                                    break;
+                                }
                             }
                         }
+                        if let Some(uuid) = target_uuid {
+                            let _ = journal.set_rewind_marker(uuid).await;
+                        }
                     }
-                    if let Some(uuid) = target_uuid {
-                        let _ = journal.set_rewind_marker(uuid).await;
-                    }
-                }
+                });
             });
         }
 
