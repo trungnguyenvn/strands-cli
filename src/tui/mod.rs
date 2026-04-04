@@ -448,6 +448,9 @@ fn handle_key(
                             if let Some(model_id) = app.selected_model_id() {
                                 app.reset_input();
                                 app.switch_model(model_id, event_tx.clone());
+                            } else if let Some(session_id) = app.selected_session_id() {
+                                app.reset_input();
+                                app.resume_session(session_id, event_tx.clone());
                             } else {
                                 app.accept_suggestion();
                                 app.submit(event_tx);

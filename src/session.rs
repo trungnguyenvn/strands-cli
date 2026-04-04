@@ -65,12 +65,12 @@ impl SessionId {
 
     /// Derive the JSONL storage path for this session.
     ///
-    /// Layout: `~/.claude/projects/<sanitized-cwd>/<id>.jsonl`
+    /// Layout: `~/.strands/sessions/<sanitized-cwd>/<id>.jsonl`
     pub fn storage_dir(cwd: &Path) -> PathBuf {
         let sanitized = sanitize_cwd(cwd);
         dirs_home()
-            .join(".claude")
-            .join("projects")
+            .join(".strands")
+            .join("sessions")
             .join(sanitized)
     }
 
@@ -195,12 +195,10 @@ pub async fn resolve_and_load(
 /// Sanitize a CWD path into a directory-safe string.
 ///
 /// Matches Claude Code's `sanitizePath()` from `sessionStoragePortable.ts`:
-/// replaces all non-alphanumeric chars with hyphens.
+/// replaces all non-alphanumeric chars with hyphens (including the leading `/`).
 fn sanitize_cwd(path: &Path) -> String {
     let s = path.to_string_lossy();
-    let trimmed = s.trim_start_matches('/');
-    trimmed
-        .chars()
+    s.chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .collect()
 }
@@ -429,14 +427,15 @@ mod tests {
     fn sanitize_cwd_replaces_slashes() {
         let p = Path::new("/home/user/my-project");
         let s = sanitize_cwd(p);
-        assert_eq!(s, "home-user-my-project");
+        // Leading / becomes - (matching Claude Code's sanitizePath)
+        assert_eq!(s, "-home-user-my-project");
     }
 
     #[test]
     fn sanitize_cwd_replaces_dots_and_spaces() {
         let p = Path::new("/home/user/my project.v2");
         let s = sanitize_cwd(p);
-        assert_eq!(s, "home-user-my-project-v2");
+        assert_eq!(s, "-home-user-my-project-v2");
     }
 
     #[test]
@@ -445,7 +444,7 @@ mod tests {
         let cwd = Path::new("/home/user/project");
         let path = id.storage_path(cwd);
         let path_str = path.to_string_lossy();
-        assert!(path_str.contains(".claude/projects/"), "path: {path_str}");
+        assert!(path_str.contains(".strands/sessions/"), "path: {path_str}");
         assert!(path_str.ends_with("test-id.jsonl"), "path: {path_str}");
     }
 
