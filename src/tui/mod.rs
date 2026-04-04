@@ -122,7 +122,8 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
             | Event::AgentToolCall { .. }
             | Event::AgentToolResult { .. }
             | Event::AgentDone
-            | Event::AgentError(_) => {
+            | Event::AgentError(_)
+            | Event::PlanModeExited => {
                 app.handle_agent_event(event);
             }
             _ => {}
