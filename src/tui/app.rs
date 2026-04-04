@@ -20,7 +20,7 @@ use crate::mcp::McpSession;
 pub enum AgentStatus {
     Idle,
     Streaming,
-    Error(String),
+    Error(#[allow(dead_code)] String),
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +313,68 @@ pub struct AppState {
     pub keybindings: super::keybindings::KeybindingMap,
     /// Tick count when Ctrl+C was last pressed (for double-tap quit).
     pub last_ctrl_c_tick: Option<usize>,
+    /// Current permission mode (cycles via Shift+Tab).
+    pub permission_mode: PermissionMode,
+}
+
+/// Permission modes matching Claude Code's Shift+Tab cycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PermissionMode {
+    /// Default — tools require per-use permission.
+    #[default]
+    Default,
+    /// Plan — read-only exploration, no file writes.
+    Plan,
+    /// Accept edits — auto-approve file edits.
+    AcceptEdits,
+    /// Bypass — auto-approve everything.
+    BypassPermissions,
+}
+
+#[allow(dead_code)]
+impl PermissionMode {
+    /// Cycle to the next mode (Shift+Tab order matches Claude Code).
+    pub fn next(&self) -> Self {
+        match self {
+            PermissionMode::Default => PermissionMode::Plan,
+            PermissionMode::Plan => PermissionMode::AcceptEdits,
+            PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
+            PermissionMode::BypassPermissions => PermissionMode::Default,
+        }
+    }
+
+    /// Display label for the status bar.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PermissionMode::Default => "Default",
+            PermissionMode::Plan => "Plan",
+            PermissionMode::AcceptEdits => "Auto-edit",
+            PermissionMode::BypassPermissions => "YOLO",
+        }
+    }
+
+    /// Parse a mode name (as returned by `CommandResult::ModeSwitch`) into a `PermissionMode`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(PermissionMode::Default),
+            "plan" => Some(PermissionMode::Plan),
+            "accept-edits" => Some(PermissionMode::AcceptEdits),
+            "bypass" => Some(PermissionMode::BypassPermissions),
+            _ => None,
+        }
+    }
+
+    /// Color for the status bar badge.
+    pub fn color(&self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            PermissionMode::Default => Color::DarkGray,
+            PermissionMode::Plan => Color::Blue,
+            PermissionMode::AcceptEdits => Color::Yellow,
+            PermissionMode::BypassPermissions => Color::Red,
+        }
+    }
 }
 
 impl AppState {
@@ -355,6 +417,7 @@ impl AppState {
             typeahead: None,
             keybindings,
             last_ctrl_c_tick: None,
+            permission_mode: PermissionMode::Default,
         }
     }
 
@@ -460,6 +523,11 @@ impl TuiApp {
                 DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
                     self.reset_input();
                     self.switch_model(model_id, event_tx);
+                    return;
+                }
+                DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
+                    self.apply_mode_switch(&mode_name);
+                    self.reset_input();
                     return;
                 }
                 DispatchResult::Prompt(expanded) => {
@@ -598,6 +666,10 @@ impl TuiApp {
             DispatchResult::Local(CommandResult::Skip) => {
                 self.reset_input();
             }
+            DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
+                self.apply_mode_switch(&mode_name);
+                self.reset_input();
+            }
             _ => {} // Non-local or prompt commands are not allowed during streaming
         }
     }
@@ -605,6 +677,46 @@ impl TuiApp {
     /// Reset the input textarea to its default state.
     /// Switch the model — shows a message and spawns async build+swap.
     /// Used by both `/model <alias>` dispatch and the interactive picker.
+    /// Apply a mode switch from /plan, /default, /accept-edits, /bypass commands
+    /// or from Shift+Tab cycling.
+    pub fn apply_mode_switch(&mut self, mode_name: &str) {
+        let (new_mode, tools_mode) = match mode_name {
+            "plan" => {
+                if let Err(e) = strands_tools::utility::plan_state::enter_plan_mode(None) {
+                    let mut msg = ChatMessage::assistant_empty();
+                    msg.append_text(&format!("Cannot enter plan mode: {}", e));
+                    self.state.messages.push(msg);
+                    return;
+                }
+                (PermissionMode::Plan, None)
+            }
+            "default" => (PermissionMode::Default, Some(strands_tools::utility::plan_state::PermissionMode::Default)),
+            "accept-edits" => (PermissionMode::AcceptEdits, Some(strands_tools::utility::plan_state::PermissionMode::AcceptEdits)),
+            "bypass" => (PermissionMode::BypassPermissions, Some(strands_tools::utility::plan_state::PermissionMode::BypassPermissions)),
+            _ => return,
+        };
+
+        let old_label = self.state.permission_mode.label();
+
+        // If leaving plan mode, exit cleanly
+        if self.state.permission_mode == PermissionMode::Plan && new_mode != PermissionMode::Plan {
+            let _ = strands_tools::utility::plan_state::exit_plan_mode(None);
+        }
+
+        // Set the tools-layer mode for non-plan modes
+        if let Some(tm) = tools_mode {
+            strands_tools::utility::plan_state::set_permission_mode(tm);
+        }
+
+        self.state.permission_mode = new_mode.clone();
+
+        let mut msg = ChatMessage::assistant_empty();
+        msg.append_text(&format!("Switched to {} mode (was: {})", new_mode.label(), old_label));
+        self.state.messages.push(msg);
+        self.state.auto_scroll = true;
+        self.state.scroll_offset = 0;
+    }
+
     pub fn switch_model(
         &mut self,
         model_id: String,

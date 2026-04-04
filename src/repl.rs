@@ -100,6 +100,19 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                     }
                     continue;
                 }
+                DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
+                    use strands_tools::utility::mode_skills;
+                    match mode_skills::handle_mode_skill(&mode_name, None) {
+                        Some(Ok(result)) => {
+                            if let Some(msg) = result.content {
+                                println!("{}", msg.green());
+                            }
+                        }
+                        Some(Err(e)) => eprintln!("{} {}", "error:".red().bold(), e),
+                        None => eprintln!("{} Unknown mode: {}", "error:".red().bold(), mode_name),
+                    }
+                    continue;
+                }
                 DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
                     println!("Switching model to {}...", model_id);
                     match crate::build_model_by_id(&model_id).await {

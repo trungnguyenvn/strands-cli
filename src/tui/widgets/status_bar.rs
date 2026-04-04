@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::tui::app::{AgentStatus, AppState, McpStatus, VimMode};
+use crate::tui::app::{AgentStatus, AppState, McpStatus, PermissionMode, VimMode};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -83,8 +83,26 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         Style::default().fg(Color::DarkGray),
     );
 
-    // Build spans: hint | model | mcp? | turns? | scroll?
+    // Permission mode badge (non-default modes shown prominently)
+    let mode_span = if state.permission_mode != PermissionMode::Default {
+        Span::styled(
+            format!(" {} ", state.permission_mode.label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(state.permission_mode.color())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
+    };
+
+    // Build spans: hint | mode? | model | mcp? | turns? | scroll?
     let mut spans = vec![hint];
+
+    if state.permission_mode != PermissionMode::Default {
+        spans.push(sep.clone());
+        spans.push(mode_span);
+    }
 
     spans.push(sep.clone());
     spans.push(model);

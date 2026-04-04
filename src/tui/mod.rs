@@ -373,6 +373,17 @@ fn handle_key(
             }
         }
 
+        // Shift+Tab — cycle permission mode (matches Claude Code)
+        (KeyModifiers::SHIFT, KeyCode::BackTab) => {
+            let next_name = match app.state.permission_mode {
+                app::PermissionMode::Default => "plan",
+                app::PermissionMode::Plan => "accept-edits",
+                app::PermissionMode::AcceptEdits => "bypass",
+                app::PermissionMode::BypassPermissions => "default",
+            };
+            app.apply_mode_switch(next_name);
+        }
+
         // Tab — accept autocomplete suggestion or typeahead
         (KeyModifiers::NONE, KeyCode::Tab) => {
             if !app.state.suggestions.is_empty() {

@@ -76,6 +76,9 @@ pub enum CommandResult {
     /// Switch the model to the given model ID string.
     /// The caller (TUI/REPL) handles async model construction and agent.swap_model().
     SwitchModel(String),
+    /// Switch the permission mode. The caller updates AppState.permission_mode
+    /// and syncs with strands_tools::plan_state.
+    ModeSwitch(String),
     /// Open the interactive model picker with available models.
     ModelPicker {
         current_model: String,
@@ -221,7 +224,8 @@ impl CommandRegistry {
 
 /// Names of built-in commands (used to distinguish from skills in /help).
 fn builtin_command_names() -> &'static [&'static str] {
-    &["exit", "clear", "help", "status", "compact", "model", "skills", "mcp"]
+    &["exit", "clear", "help", "status", "compact", "model", "skills", "mcp",
+      "plan", "default", "accept-edits", "bypass"]
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +372,58 @@ fn builtin_commands() -> Vec<Command> {
                 execute: cmd_mcp,
             },
         },
+        // /plan
+        Command {
+            name: "plan".into(),
+            description: "Enter plan mode — read-only exploration".into(),
+            aliases: vec![],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: |_, _| CommandResult::ModeSwitch("plan".into()),
+            },
+        },
+        // /default
+        Command {
+            name: "default".into(),
+            description: "Switch to default mode".into(),
+            aliases: vec![],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: |_, _| CommandResult::ModeSwitch("default".into()),
+            },
+        },
+        // /accept-edits
+        Command {
+            name: "accept-edits".into(),
+            description: "Auto-approve file edits".into(),
+            aliases: vec!["auto-edit".into()],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: |_, _| CommandResult::ModeSwitch("accept-edits".into()),
+            },
+        },
+        // /bypass
+        Command {
+            name: "bypass".into(),
+            description: "Bypass all permission checks (YOLO mode)".into(),
+            aliases: vec!["yolo".into()],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: |_, _| CommandResult::ModeSwitch("bypass".into()),
+            },
+        },
         // /compact
         Command {
             name: "compact".into(),
@@ -445,7 +501,7 @@ fn cmd_help(_args: &str, ctx: &CommandContext) -> CommandResult {
     }
 
     lines.push(String::new());
-    lines.push("Tip: pgup/pgdn to scroll, Ctrl+C to cancel a running query.".to_string());
+    lines.push("Tip: pgup/pgdn to scroll, Shift+Tab to cycle mode, Ctrl+C to cancel.".to_string());
     CommandResult::Text(lines.join("\n"))
 }
 

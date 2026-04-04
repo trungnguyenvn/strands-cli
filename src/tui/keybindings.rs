@@ -47,6 +47,7 @@ pub enum Action {
     HistoryPrevious,
     HistoryNext,
     ToggleVimMode,
+    CycleMode,
     PermissionAllow,
     PermissionDeny,
 }
@@ -81,6 +82,9 @@ pub fn default_keybindings() -> KeybindingMap {
     ]);
     map.insert(Action::ToggleVimMode, vec![
         KeyChord::new(KeyModifiers::CONTROL, KeyCode::Char('v')),
+    ]);
+    map.insert(Action::CycleMode, vec![
+        KeyChord::new(KeyModifiers::SHIFT, KeyCode::BackTab),
     ]);
     map.insert(Action::PermissionAllow, vec![
         KeyChord::new(KeyModifiers::NONE, KeyCode::Char('y')),
