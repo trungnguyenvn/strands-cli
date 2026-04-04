@@ -7,7 +7,7 @@ use strands::Agent;
 
 use super::event::Event;
 use crate::commands::{
-    self, builtin_registry, CommandContext, CommandKind, CommandRegistry, CommandResult,
+    self, CommandContext, CommandKind, CommandRegistry, CommandResult,
     DispatchResult, SuggestionItem,
 };
 
@@ -129,7 +129,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(model_name: String) -> Self {
+    pub fn new(model_name: String, command_registry: CommandRegistry) -> Self {
         let mut input = tui_textarea::TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
         input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
@@ -150,7 +150,7 @@ impl AppState {
             history_index: None,
             history_stash: String::new(),
             cancel_agent: None,
-            command_registry: builtin_registry(),
+            command_registry,
             suggestions: Vec::new(),
             selected_suggestion: -1,
         }
@@ -167,9 +167,9 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    pub fn new(agent: Agent, model_name: String) -> Self {
+    pub fn new(agent: Agent, model_name: String, command_registry: CommandRegistry) -> Self {
         Self {
-            state: AppState::new(model_name),
+            state: AppState::new(model_name, command_registry),
             agent,
         }
     }
@@ -189,6 +189,7 @@ impl TuiApp {
                 model_name: self.state.model_name.clone(),
                 turn_count: self.state.turn_count,
                 message_count: self.state.messages.len(),
+                all_commands: self.state.command_registry.command_infos(),
             };
             match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {
                 DispatchResult::Local(CommandResult::Quit) => {
@@ -213,6 +214,41 @@ impl TuiApp {
                 }
                 DispatchResult::Local(CommandResult::Skip) => {
                     self.reset_input();
+                    return;
+                }
+                DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
+                    self.state.messages.push(ChatMessage::user(trimmed.to_string()));
+                    let mut msg = ChatMessage::assistant_empty();
+                    msg.append_text(&format!("Switching model to {}...", model_id));
+                    self.state.messages.push(msg);
+                    self.state.auto_scroll = true;
+                    self.state.scroll_offset = 0;
+                    self.reset_input();
+
+                    // Build new model and swap (async)
+                    let agent = self.agent.clone();
+                    let event_tx_clone = event_tx.clone();
+                    let model_id_clone = model_id.clone();
+                    let new_model_name = model_id.clone();
+                    tokio::spawn(async move {
+                        match crate::build_model_by_id(&model_id_clone).await {
+                            Ok(new_model) => {
+                                agent.swap_model(new_model);
+                                let _ = event_tx_clone.send(Event::AgentTextDelta(
+                                    format!("\nModel switched to {}", model_id_clone),
+                                ));
+                                let _ = event_tx_clone.send(Event::AgentDone);
+                            }
+                            Err(e) => {
+                                let _ = event_tx_clone.send(Event::AgentError(
+                                    format!("Failed to switch model: {}", e),
+                                ));
+                                let _ = event_tx_clone.send(Event::AgentDone);
+                            }
+                        }
+                    });
+                    self.state.model_name = new_model_name;
+                    self.state.agent_status = AgentStatus::Streaming;
                     return;
                 }
                 DispatchResult::Prompt(expanded) => {
@@ -313,6 +349,7 @@ impl TuiApp {
             model_name: self.state.model_name.clone(),
             turn_count: self.state.turn_count,
             message_count: self.state.messages.len(),
+            all_commands: self.state.command_registry.command_infos(),
         };
 
         match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {

@@ -3,6 +3,7 @@
 //! A Claude Code-inspired fullscreen TUI that wires core coding tools (shell,
 //! file read/write/edit, glob, grep, think) to a configurable model provider.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,6 +20,10 @@ use strands::{Agent, Result};
 // Tools from strands-tools
 use strands_tools::advanced::ThinkTool;
 use strands_tools::system::ShellTool;
+use strands_tools::utility::skill::{
+    SkillCallback, SkillExecutionResult, SkillTool, get_skill,
+};
+use strands_tools::utility::skill_loader::{load_skills_dir, register_loaded_skill};
 use strands_tools::{FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool};
 
 mod commands;
@@ -35,7 +40,7 @@ mod tui;
 #[derive(Parser, Debug)]
 #[command(name = "strands", about = "Interactive CLI for Strands Agents")]
 struct Cli {
-    /// Model provider: "anthropic" or "bedrock"
+    /// Model provider: anthropic, bedrock, openai, ollama, mistral
     #[arg(short, long, default_value = "anthropic", env = "STRANDS_PROVIDER")]
     provider: String,
 
@@ -73,7 +78,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| match cli.provider.as_str() {
             "bedrock" => "bedrock/default".to_string(),
-            _ => "claude-sonnet-4-20250514".to_string(),
+            _ => "claude-sonnet-4-6-20250514".to_string(),
         });
 
     // Build model
@@ -91,6 +96,12 @@ async fn main() -> Result<()> {
     let mcp_session = mcp::load_mcp_servers(&cwd).await;
     tools.extend(mcp_session.tools);
 
+    // Load skills from .strands/skills/ and .claude/skills/
+    let (skill_infos, skill_cmd_infos) = load_skills(&cwd, &mut tools);
+
+    // Build command registry with skills
+    let command_registry = commands::build_registry(&skill_cmd_infos);
+
     // Build system prompt
     let tool_names: Vec<String> = tools.iter().map(|t| t.tool_name().to_string()).collect();
     let cwd_str = cwd.display().to_string();
@@ -103,6 +114,7 @@ async fn main() -> Result<()> {
         git: git_ctx.as_ref(),
         date: &date,
         has_user_context: user_ctx.is_some(),
+        skills: &skill_infos,
         mcp_server_names: &mcp_session.server_names,
     };
     let source = match cli.system.clone() {
@@ -138,9 +150,9 @@ async fn main() -> Result<()> {
     if let Some(prompt) = &cli.oneshot {
         repl::run_single_turn(&agent, prompt).await?;
     } else if cli.no_tui {
-        repl::run_repl(&agent).await?;
+        repl::run_repl(&agent, command_registry).await?;
     } else {
-        tui::run(agent, model_name).await?;
+        tui::run(agent, model_name, command_registry).await?;
     }
 
     Ok(())
@@ -158,7 +170,7 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
             let model_id = cli
                 .model
                 .clone()
-                .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+                .unwrap_or_else(|| "claude-sonnet-4-6-20250514".to_string());
 
             let config = AnthropicConfig {
                 model_id: model_id.clone(),
@@ -184,15 +196,170 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
 
             Ok(Arc::new(model))
         }
+        "openai" => {
+            use strands::models::openai::{OpenAIConfig, OpenAIModel};
+
+            let model_id = cli
+                .model
+                .clone()
+                .unwrap_or_else(|| "gpt-4o".to_string());
+
+            let api_key = std::env::var("OPENAI_API_KEY").ok();
+            let config = OpenAIConfig {
+                model_id: model_id.clone(),
+                max_tokens: Some(16384),
+                ..Default::default()
+            };
+
+            let model = OpenAIModel::new(Some(model_id), api_key, None, Some(config)).await?;
+            Ok(Arc::new(model))
+        }
+        "ollama" => {
+            use strands::models::ollama::{OllamaConfig, OllamaModel};
+
+            let model_id = cli.model.clone().unwrap_or_else(|| "llama3.2".to_string());
+            let base_url = std::env::var("OLLAMA_BASE_URL").ok();
+            let config = OllamaConfig {
+                model_id: model_id.clone(),
+                ..Default::default()
+            };
+
+            let model = OllamaModel::new(Some(model_id), base_url, config).await?;
+            Ok(Arc::new(model))
+        }
+        "mistral" => {
+            use strands::models::mistral::{MistralConfig, MistralModel};
+
+            let model_id = cli
+                .model
+                .clone()
+                .unwrap_or_else(|| "mistral-large-latest".to_string());
+
+            let api_key = std::env::var("MISTRAL_API_KEY").ok();
+            let config = MistralConfig {
+                model_id: model_id.clone(),
+                ..Default::default()
+            };
+
+            let model = MistralModel::new(Some(model_id), api_key, None, config).await?;
+            Ok(Arc::new(model))
+        }
         other => {
             eprintln!(
-                "{} Unknown provider '{}'. Use 'anthropic' or 'bedrock'.",
+                "{} Unknown provider '{}'. Supported: anthropic, bedrock, openai, ollama, mistral.",
                 "error:".red().bold(),
                 other
             );
             std::process::exit(1);
         }
     }
+}
+
+/// Build a model by ID string — used for runtime `/model` switching.
+/// Detects provider from model ID prefix, explicit `provider/model` syntax, or environment.
+///
+/// Provider detection rules:
+/// - `bedrock/MODEL` or Bedrock-style IDs (`global.*`, `us.*`, ARNs with `:`) → Bedrock
+/// - `openai/MODEL` or OpenAI-style IDs (`gpt-*`, `o1-*`, `o3-*`) → OpenAI
+/// - `ollama/MODEL` → Ollama (local)
+/// - `mistral/MODEL` or `mistral-*` → Mistral
+/// - `claude-*` or unrecognized → Anthropic direct API (default)
+pub async fn build_model_by_id(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
+    // Check for explicit provider/ prefix
+    if let Some(rest) = model_id.strip_prefix("bedrock/") {
+        return build_bedrock_model(rest).await;
+    }
+    if let Some(rest) = model_id.strip_prefix("openai/") {
+        return build_openai_model(rest).await;
+    }
+    if let Some(rest) = model_id.strip_prefix("ollama/") {
+        return build_ollama_model(rest).await;
+    }
+    if let Some(rest) = model_id.strip_prefix("mistral/") {
+        return build_mistral_model(rest).await;
+    }
+    if let Some(rest) = model_id.strip_prefix("anthropic/") {
+        return build_anthropic_model(rest).await;
+    }
+
+    // Auto-detect from model ID pattern
+    let is_bedrock = model_id.starts_with("us.")
+        || model_id.starts_with("eu.")
+        || model_id.starts_with("ap.")
+        || model_id.starts_with("global.")
+        || model_id.starts_with("amazon.")
+        || model_id.starts_with("meta.")
+        || model_id.contains(":"); // Bedrock ARN-style IDs
+
+    if is_bedrock {
+        return build_bedrock_model(model_id).await;
+    }
+
+    if model_id.starts_with("gpt-") || model_id.starts_with("o1-") || model_id.starts_with("o3-") {
+        return build_openai_model(model_id).await;
+    }
+
+    if model_id.starts_with("mistral-") || model_id.starts_with("codestral-") || model_id.starts_with("pixtral-") {
+        return build_mistral_model(model_id).await;
+    }
+
+    // Default: Anthropic direct API
+    build_anthropic_model(model_id).await
+}
+
+async fn build_anthropic_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
+    use strands::models::anthropic::{AnthropicConfig, AnthropicModel};
+    let config = AnthropicConfig {
+        model_id: model_id.to_string(),
+        max_tokens: Some(16384),
+        ..Default::default()
+    };
+    let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let model = AnthropicModel::new(Some(model_id.to_string()), api_key, None, config).await?;
+    Ok(Arc::new(model))
+}
+
+async fn build_bedrock_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
+    use strands::models::bedrock::{BedrockConfig, BedrockModel};
+    let mut config = BedrockConfig::default();
+    config.model_id = model_id.to_string();
+    config.max_tokens = Some(16384);
+    let model = BedrockModel::new(None, None, None, config).await?;
+    Ok(Arc::new(model))
+}
+
+async fn build_openai_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
+    use strands::models::openai::{OpenAIConfig, OpenAIModel};
+    let api_key = std::env::var("OPENAI_API_KEY").ok();
+    let config = OpenAIConfig {
+        model_id: model_id.to_string(),
+        max_tokens: Some(16384),
+        ..Default::default()
+    };
+    let model = OpenAIModel::new(Some(model_id.to_string()), api_key, None, Some(config)).await?;
+    Ok(Arc::new(model))
+}
+
+async fn build_ollama_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
+    use strands::models::ollama::{OllamaConfig, OllamaModel};
+    let base_url = std::env::var("OLLAMA_BASE_URL").ok();
+    let config = OllamaConfig {
+        model_id: model_id.to_string(),
+        ..Default::default()
+    };
+    let model = OllamaModel::new(Some(model_id.to_string()), base_url, config).await?;
+    Ok(Arc::new(model))
+}
+
+async fn build_mistral_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
+    use strands::models::mistral::{MistralConfig, MistralModel};
+    let api_key = std::env::var("MISTRAL_API_KEY").ok();
+    let config = MistralConfig {
+        model_id: model_id.to_string(),
+        ..Default::default()
+    };
+    let model = MistralModel::new(Some(model_id.to_string()), api_key, None, config).await?;
+    Ok(Arc::new(model))
 }
 
 // ---------------------------------------------------------------------------
@@ -330,5 +497,80 @@ fn bash_execute(tool_use: &ToolUse) -> Result<ToolResult> {
             format!("Failed to execute command: {}", e),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Skill loading
+// ---------------------------------------------------------------------------
+
+/// Discover skills, register them, create a SkillTool, and return info for
+/// prompt rendering and command registry.
+fn load_skills(
+    cwd: &std::path::Path,
+    tools: &mut Vec<Arc<dyn AgentTool>>,
+) -> (Vec<prompt::section::SkillInfo>, Vec<commands::SkillCommandInfo>) {
+    use strands_tools::utility::skill_loader::LoadedSkill;
+
+    // Discover skills from .strands/skills/ and .claude/skills/ (project + user home)
+    let mut all_skills: Vec<LoadedSkill> = Vec::new();
+    for dir_name in &[".strands", ".claude"] {
+        let skills_dir = cwd.join(dir_name).join("skills");
+        all_skills.extend(load_skills_dir(&skills_dir, "project"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for dir_name in &[".strands", ".claude"] {
+            let skills_dir = home.join(dir_name).join("skills");
+            all_skills.extend(load_skills_dir(&skills_dir, "user"));
+        }
+    }
+
+    // Deduplicate by name (later entries win)
+    let mut seen: HashMap<String, &LoadedSkill> = HashMap::new();
+    for skill in &all_skills {
+        seen.insert(skill.name.clone(), skill);
+    }
+
+    // Register in global registry and build content map
+    let mut skill_content_map: HashMap<String, String> = HashMap::new();
+    let mut skill_infos: Vec<prompt::section::SkillInfo> = Vec::new();
+    let mut skill_cmd_infos: Vec<commands::SkillCommandInfo> = Vec::new();
+
+    for skill in seen.values() {
+        let def = register_loaded_skill(skill);
+        skill_content_map.insert(skill.name.clone(), skill.content.clone());
+
+        skill_infos.push(prompt::section::SkillInfo {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            when_to_use: skill.frontmatter.when_to_use.clone(),
+        });
+
+        skill_cmd_infos.push(commands::SkillCommandInfo {
+            name: skill.name.clone(),
+            description: def.description.clone(),
+            argument_hint: skill.frontmatter.argument_hint.clone(),
+            body: skill.content.clone(),
+        });
+    }
+
+    // Create SkillTool with callback that returns skill content
+    let content_map = skill_content_map;
+    let skill_callback: SkillCallback = Arc::new(move |name, args| {
+        let _def = get_skill(name)
+            .ok_or_else(|| format!("Unknown skill: {}", name))?;
+        let content = content_map.get(name).cloned().unwrap_or_default();
+        let final_content = match args {
+            Some(a) if !a.is_empty() => content.replace("$ARGUMENTS", a),
+            _ => content,
+        };
+        Ok(SkillExecutionResult {
+            content: Some(final_content),
+            result: None,
+            agent_id: None,
+        })
+    });
+    tools.push(Arc::new(SkillTool::with_callback(skill_callback)));
+
+    (skill_infos, skill_cmd_infos)
 }
 

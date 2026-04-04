@@ -10,10 +10,10 @@ use futures::StreamExt;
 use strands::Agent;
 
 use crate::commands::{
-    self, builtin_registry, CommandContext, CommandResult, DispatchResult,
+    self, CommandContext, CommandRegistry, CommandResult, DispatchResult,
 };
 
-pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
+pub async fn run_repl(agent: &Agent, registry: CommandRegistry) -> strands::Result<()> {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
@@ -27,7 +27,6 @@ pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
         "/clear".yellow()
     );
 
-    let registry = builtin_registry();
     let stdin = io::stdin();
     let mut turn_count: usize = 0;
     let mut message_count: usize = 0;
@@ -51,6 +50,7 @@ pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
                 model_name: String::new(), // not available in plain REPL
                 turn_count,
                 message_count,
+                all_commands: registry.command_infos(),
             };
             match commands::dispatch(input, &registry, &ctx) {
                 DispatchResult::Local(CommandResult::Quit) => break,
@@ -65,6 +65,19 @@ pub async fn run_repl(agent: &Agent) -> strands::Result<()> {
                     continue;
                 }
                 DispatchResult::Local(CommandResult::Skip) => continue,
+                DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
+                    println!("Switching model to {}...", model_id);
+                    match crate::build_model_by_id(&model_id).await {
+                        Ok(new_model) => {
+                            agent.swap_model(new_model);
+                            println!("{}", format!("Model switched to {}", model_id).green());
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "error:".red().bold(), e);
+                        }
+                    }
+                    continue;
+                }
                 DispatchResult::Prompt(expanded) => {
                     turn_count += 1;
                     message_count += 2;

@@ -44,6 +44,38 @@ impl PromptSection for EnvInfoSection {
 }
 
 // ---------------------------------------------------------------------------
+// Skills listing
+// ---------------------------------------------------------------------------
+
+pub struct SkillsSection;
+
+impl PromptSection for SkillsSection {
+    fn name(&self) -> &'static str { "skills" }
+
+    fn render(&self, ctx: &RenderContext<'_>) -> Option<String> {
+        if ctx.skills.is_empty() {
+            return None;
+        }
+
+        let mut lines = vec![
+            "# Skills".to_string(),
+            "Use the Skill tool to invoke skills, or type /skillname:".to_string(),
+            String::new(),
+        ];
+
+        for skill in ctx.skills {
+            let mut entry = format!("- {}: {}", skill.name, skill.description);
+            if let Some(ref when) = skill.when_to_use {
+                entry.push_str(&format!(" — {}", when));
+            }
+            lines.push(entry);
+        }
+
+        Some(lines.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session guidance
 // ---------------------------------------------------------------------------
 

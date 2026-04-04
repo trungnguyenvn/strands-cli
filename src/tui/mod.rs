@@ -18,7 +18,7 @@ use self::terminal::Tui;
 use self::widgets::input_bar::{self, InputAction};
 
 /// Run the fullscreen TUI.
-pub async fn run(agent: Agent, model_name: String) -> strands::Result<()> {
+pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry) -> strands::Result<()> {
     // Install panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -34,7 +34,7 @@ pub async fn run(agent: Agent, model_name: String) -> strands::Result<()> {
     let mut tui = Tui::new(12.0, 30.0).map_err(|e| strands::Error::Configuration(e.to_string()))?;
     tui.enter().map_err(|e| strands::Error::Configuration(e.to_string()))?;
 
-    let mut app = TuiApp::new(agent, model_name);
+    let mut app = TuiApp::new(agent, model_name, command_registry);
     let mut event_rx = tui.event_rx.take().unwrap();
     let event_tx = tui.event_tx.clone();
 

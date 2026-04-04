@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Strands SDK and tools
-strands-agents = { path = "../sdk-rust", features = ["anthropic"] }
-strands-tools = { path = "../tools-rust", features = ["file-tools", "system-tools", "advanced-tools"] }
+strands-agents = { path = "../sdk-rust", features = ["anthropic", "openai"] }
+strands-tools = { path = "../tools-rust", features = ["file-tools", "system-tools", "advanced-tools", "utility-tools"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

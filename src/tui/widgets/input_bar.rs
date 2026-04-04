@@ -76,8 +76,8 @@ fn render_argument_hint(state: &AppState, frame: &mut Frame, area: Rect) {
     };
 
     let hint = match state.command_registry.find(&parsed.command_name) {
-        Some(cmd) => match cmd.argument_hint {
-            Some(h) => h,
+        Some(cmd) => match &cmd.argument_hint {
+            Some(h) => h.as_str(),
             None => return,
         },
         None => return,

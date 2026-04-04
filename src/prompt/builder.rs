@@ -2,7 +2,7 @@
 
 use super::section::{PromptSection, RenderContext};
 use super::static_sections::*;
-use super::dynamic_sections::*;
+use super::dynamic_sections::{EnvInfoSection, SessionGuidanceSection, SkillsSection};
 
 /// Collects prompt sections and renders them to a single string.
 pub struct PromptBuilder {
@@ -22,6 +22,7 @@ impl PromptBuilder {
                 Box::new(ToneSection),
                 Box::new(OutputEfficiencySection),
                 Box::new(EnvInfoSection),
+                Box::new(SkillsSection),
                 Box::new(SessionGuidanceSection),
             ],
         }

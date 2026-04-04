@@ -19,7 +19,7 @@ use super::widgets::input_bar;
 
 /// Create a default AppState with a given terminal width/height.
 fn make_state(width: u16, _height: u16) -> AppState {
-    let mut state = AppState::new("test-model".to_string());
+    let mut state = AppState::new("test-model".to_string(), crate::commands::builtin_registry());
     state.terminal_width = width;
     state
 }
@@ -147,6 +147,7 @@ fn slash_help_renders_command_list() {
         model_name: state.model_name.clone(),
         turn_count: state.turn_count,
         message_count: state.messages.len(),
+        all_commands: state.command_registry.command_infos(),
     };
     match crate::commands::dispatch("/help", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -195,6 +196,7 @@ fn slash_status_renders_session_info() {
         model_name: "test-model".into(),
         turn_count: 5,
         message_count: 0,
+        all_commands: state.command_registry.command_infos(),
     };
     match crate::commands::dispatch("/status", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -236,6 +238,7 @@ fn slash_clear_empties_messages() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 2,
+    all_commands: state.command_registry.command_infos(),
     };
     match crate::commands::dispatch("/clear", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Clear) => {
@@ -265,6 +268,7 @@ fn slash_exit_sets_quit_flag() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
 
     match crate::commands::dispatch("/exit", &state.command_registry, &ctx) {
@@ -289,6 +293,7 @@ fn slash_new_alias_triggers_clear() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
 
     match crate::commands::dispatch("/new", &state.command_registry, &ctx) {
@@ -312,6 +317,7 @@ fn slash_question_mark_alias_triggers_help() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
 
     match crate::commands::dispatch("/?", &state.command_registry, &ctx) {
@@ -336,6 +342,7 @@ fn slash_compact_returns_prompt() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
 
     match crate::commands::dispatch("/compact", &state.command_registry, &ctx) {
@@ -356,6 +363,7 @@ fn slash_compact_with_args_includes_custom_instructions() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
 
     match crate::commands::dispatch("/compact keep all file paths", &state.command_registry, &ctx) {
@@ -381,6 +389,7 @@ fn unknown_command_renders_error() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
     match crate::commands::dispatch("/nonexistent", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Unknown(name) => {
@@ -419,6 +428,7 @@ fn file_path_is_not_a_command() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
 
     match crate::commands::dispatch("/var/log/foo", &state.command_registry, &ctx) {
@@ -662,6 +672,7 @@ fn try_immediate_command_status_during_streaming() {
         model_name: state.model_name.clone(),
         turn_count: 0,
         message_count: 0,
+    all_commands: state.command_registry.command_infos(),
     };
     match crate::commands::dispatch(trimmed, &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -706,9 +717,9 @@ fn disabled_command_treated_as_unknown() {
     use crate::commands::{Command, CommandKind, CommandRegistry, CommandResult};
 
     let reg = CommandRegistry::new(vec![Command {
-        name: "secret",
-        description: "Hidden command",
-        aliases: &[],
+        name: "secret".into(),
+        description: "Hidden command".into(),
+        aliases: vec![],
         is_hidden: true,
         argument_hint: None,
         is_enabled: Some(|| false), // disabled!
@@ -722,6 +733,7 @@ fn disabled_command_treated_as_unknown() {
         model_name: "test".into(),
         turn_count: 0,
         message_count: 0,
+        all_commands: reg.command_infos(),
     };
 
     match crate::commands::dispatch("/secret", &reg, &ctx) {
