@@ -52,7 +52,11 @@ pub fn render_suggestions(
         let is_selected = idx == sel;
 
         let prefix = if is_selected { "❯ " } else { "  " };
-        let padded_name = format!("/{:<width$}", item.name, width = max_name_len);
+        let padded_name = if item.no_slash_prefix {
+            format!(" {:<width$}", item.name, width = max_name_len)
+        } else {
+            format!("/{:<width$}", item.name, width = max_name_len)
+        };
 
         // Truncate description to fit
         let desc_width = (area.width as usize)

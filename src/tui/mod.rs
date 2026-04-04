@@ -165,7 +165,8 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
             | Event::AgentToolResult { .. }
             | Event::AgentDone
             | Event::AgentError(_)
-            | Event::PlanModeExited => {
+            | Event::EnterPlanModeRequested
+            | Event::PlanModeExitRequested { .. } => {
                 app.handle_agent_event(event);
             }
             _ => {}
@@ -384,7 +385,10 @@ fn handle_key(
 
         // Escape — dismiss suggestions, cancel streaming, or double-tap rewind
         (KeyModifiers::NONE, KeyCode::Esc) => {
-            if !app.state.suggestions.is_empty() {
+            if app.state.awaiting_plan_decision.is_some() {
+                // Plan mode decision is mandatory — re-inject suggestions instead of dismissing
+                app.reinject_plan_suggestions();
+            } else if !app.state.suggestions.is_empty() {
                 app.state.suggestions.clear();
                 app.state.selected_suggestion = -1;
             } else if matches!(app.state.agent_status, AgentStatus::Streaming) {
@@ -504,7 +508,10 @@ fn handle_key(
                 match input_bar::handle_input_key(&mut app.state, key) {
                     InputAction::Submit => {
                         if has_suggestions && app.state.selected_suggestion >= 0 {
-                            if let Some(model_id) = app.selected_model_id() {
+                            if let Some(action) = app.selected_plan_mode_action() {
+                                app.reset_input();
+                                app.handle_plan_mode_action(action, event_tx.clone());
+                            } else if let Some(model_id) = app.selected_model_id() {
                                 app.reset_input();
                                 app.switch_model(model_id, event_tx.clone());
                             } else if let Some(session_id) = app.selected_session_id() {

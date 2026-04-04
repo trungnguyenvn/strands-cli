@@ -1243,6 +1243,21 @@ fn cmd_compact_prompt(args: &str, _ctx: &CommandContext) -> String {
 // Autocomplete suggestions
 // ---------------------------------------------------------------------------
 
+/// Action to take when a plan mode suggestion is selected.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanModeAction {
+    /// User confirms entering plan mode.
+    ConfirmEnter,
+    /// User rejects entering plan mode — start implementing now.
+    RejectEnter,
+    /// Approve plan and switch to AcceptEdits mode (auto-accept file edits).
+    ApproveAcceptEdits,
+    /// Approve plan and stay in Default mode (manually approve each edit).
+    ApproveManual,
+    /// Reject plan exit — stay in plan mode, user will type feedback.
+    KeepPlanning,
+}
+
 /// A suggestion item for the autocomplete dropdown.
 #[derive(Clone, Debug)]
 pub struct SuggestionItem {
@@ -1257,6 +1272,10 @@ pub struct SuggestionItem {
     /// When set, this suggestion represents a rewind target.
     /// (message_index, message_id) — selecting it triggers a rewind.
     pub rewind_info: Option<(usize, String)>,
+    /// When set, this suggestion represents a plan mode decision.
+    pub plan_mode_action: Option<PlanModeAction>,
+    /// When true, render without the "/" prefix (used for plan mode options).
+    pub no_slash_prefix: bool,
 }
 
 /// Generate command suggestions for a partial input.
@@ -1311,6 +1330,8 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_mod
             model_id: None,
             session_id: None,
             rewind_info: None,
+            plan_mode_action: None,
+            no_slash_prefix: false,
         })
         .collect();
 
@@ -1356,6 +1377,8 @@ fn generate_model_suggestions(query: &str, current_model: &str) -> Vec<Suggestio
                 model_id: Some(item.model_id),
                 session_id: None,
                 rewind_info: None,
+                plan_mode_action: None,
+                no_slash_prefix: false,
             }
         })
         .collect();
@@ -1440,6 +1463,8 @@ fn generate_session_suggestions(query: &str) -> Vec<SuggestionItem> {
                 model_id: None,
                 session_id: Some(s.session_id),
                 rewind_info: None,
+                plan_mode_action: None,
+                no_slash_prefix: false,
             }
         })
         .collect()

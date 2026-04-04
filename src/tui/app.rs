@@ -10,7 +10,7 @@ use strands::Agent;
 use super::event::Event;
 use crate::commands::{
     self, CommandContext, CommandKind, CommandRegistry, CommandResult,
-    DispatchResult, SuggestionItem,
+    DispatchResult, PlanModeAction, SuggestionItem,
 };
 use crate::mcp::McpSession;
 
@@ -415,6 +415,28 @@ pub struct AppState {
     /// Session title (custom or AI-generated). Displayed in status bar.
     /// Priority: custom_title > ai_title > None.
     pub session_title: Option<String>,
+
+    // --- Plan mode decision UI ---
+
+    /// When set, the suggestion dropdown shows plan mode choices and Esc re-injects them.
+    pub awaiting_plan_decision: Option<PlanDecisionKind>,
+    /// Stored plan content when awaiting exit decision.
+    pub pending_plan_content: Option<String>,
+    /// Stored plan file path when awaiting exit decision.
+    pub pending_plan_file: Option<String>,
+    /// When true, suppress future EnterPlanModeRequested popups (user already rejected).
+    pub plan_mode_enter_rejected: bool,
+    /// When true, suppress future PlanModeExitRequested popups (user already approved/handled).
+    pub plan_mode_exit_handled: bool,
+}
+
+/// Whether we're awaiting a plan mode decision from the user.
+#[derive(Clone, Debug)]
+pub enum PlanDecisionKind {
+    /// Waiting for user to confirm/reject entering plan mode.
+    Enter,
+    /// Waiting for user to approve/reject the plan.
+    Exit,
 }
 
 /// Permission modes matching Claude Code's Shift+Tab cycle.
@@ -531,6 +553,11 @@ impl AppState {
             last_esc_tick: None,
             session_id: None,
             session_title: None,
+            awaiting_plan_decision: None,
+            pending_plan_content: None,
+            pending_plan_file: None,
+            plan_mode_enter_rejected: false,
+            plan_mode_exit_handled: false,
         }
     }
 
@@ -986,6 +1013,9 @@ impl TuiApp {
                     self.state.messages.push(msg);
                     return;
                 }
+                // Reset suppression flags for new plan session
+                self.state.plan_mode_enter_rejected = false;
+                self.state.plan_mode_exit_handled = false;
                 // Store system-reminder for injection into next agent call
                 let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
                 let reminder = strands_tools::utility::plan_state::build_plan_mode_system_reminder(&plan_file);
@@ -1188,6 +1218,252 @@ impl TuiApp {
             .clone()
     }
 
+    /// If the selected suggestion is a plan mode action, return it.
+    pub fn selected_plan_mode_action(&self) -> Option<PlanModeAction> {
+        if self.state.selected_suggestion < 0
+            || self.state.selected_suggestion as usize >= self.state.suggestions.len()
+        {
+            return None;
+        }
+        self.state.suggestions[self.state.selected_suggestion as usize]
+            .plan_mode_action
+            .clone()
+    }
+
+    /// Populate suggestions with plan mode enter options.
+    pub fn show_enter_plan_suggestions(&mut self) {
+        self.state.suggestions = vec![
+            SuggestionItem {
+                name: "Yes, enter plan mode".to_string(),
+                description: "Explore codebase and design approach before coding".to_string(),
+                model_id: None,
+                session_id: None,
+                rewind_info: None,
+                plan_mode_action: Some(PlanModeAction::ConfirmEnter),
+                no_slash_prefix: true,
+            },
+            SuggestionItem {
+                name: "No, start implementing now".to_string(),
+                description: "Skip planning, start coding directly".to_string(),
+                model_id: None,
+                session_id: None,
+                rewind_info: None,
+                plan_mode_action: Some(PlanModeAction::RejectEnter),
+                no_slash_prefix: true,
+            },
+        ];
+        self.state.selected_suggestion = 0;
+        self.state.awaiting_plan_decision = Some(PlanDecisionKind::Enter);
+    }
+
+    /// Populate suggestions with plan mode exit/approval options.
+    pub fn show_exit_plan_suggestions(&mut self) {
+        self.state.suggestions = vec![
+            SuggestionItem {
+                name: "Yes, auto-accept edits".to_string(),
+                description: "Approve plan and auto-accept file edits".to_string(),
+                model_id: None,
+                session_id: None,
+                rewind_info: None,
+                plan_mode_action: Some(PlanModeAction::ApproveAcceptEdits),
+                no_slash_prefix: true,
+            },
+            SuggestionItem {
+                name: "Yes, manually approve edits".to_string(),
+                description: "Approve plan and confirm each edit".to_string(),
+                model_id: None,
+                session_id: None,
+                rewind_info: None,
+                plan_mode_action: Some(PlanModeAction::ApproveManual),
+                no_slash_prefix: true,
+            },
+            SuggestionItem {
+                name: "No, keep planning".to_string(),
+                description: "Stay in plan mode — type feedback below".to_string(),
+                model_id: None,
+                session_id: None,
+                rewind_info: None,
+                plan_mode_action: Some(PlanModeAction::KeepPlanning),
+                no_slash_prefix: true,
+            },
+        ];
+        self.state.selected_suggestion = 0;
+        self.state.awaiting_plan_decision = Some(PlanDecisionKind::Exit);
+    }
+
+    /// Re-inject plan mode suggestions (called when user presses Esc during plan decision).
+    pub fn reinject_plan_suggestions(&mut self) {
+        match &self.state.awaiting_plan_decision {
+            Some(PlanDecisionKind::Enter) => self.show_enter_plan_suggestions(),
+            Some(PlanDecisionKind::Exit) => self.show_exit_plan_suggestions(),
+            None => {}
+        }
+    }
+
+    /// Handle a plan mode action selected from the suggestion dropdown.
+    pub fn handle_plan_mode_action(
+        &mut self,
+        action: PlanModeAction,
+        event_tx: UnboundedSender<Event>,
+    ) {
+        // Clear suggestion UI state
+        self.state.suggestions.clear();
+        self.state.selected_suggestion = -1;
+        let _decision_kind = self.state.awaiting_plan_decision.take();
+
+        match action {
+            PlanModeAction::ConfirmEnter => {
+                // Reset exit flag — new plan mode session starts
+                self.state.plan_mode_exit_handled = false;
+                // Enter plan mode now (we undid the tool's side-effect in the event handler).
+                let _ = strands_tools::utility::plan_state::enter_plan_mode(None);
+                self.state.permission_mode = PermissionMode::Plan;
+
+                let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                self.state.pending_system_reminder = Some(
+                    strands_tools::utility::plan_state::build_plan_mode_system_reminder(
+                        &plan_file,
+                    ),
+                );
+
+                let mut msg = ChatMessage::assistant_empty();
+                msg.append_text("Entered plan mode. Exploring codebase and designing approach...");
+                self.state.messages.push(msg);
+                self.state.auto_scroll = true;
+                self.state.scroll_offset = 0;
+
+                // Resume agent with confirmation
+                self.send_to_agent("Yes, enter plan mode. Continue with planning.".to_string(), event_tx);
+            }
+            PlanModeAction::RejectEnter => {
+                // Plan mode was already undone in the event handler — just set UI mode.
+                self.state.permission_mode = PermissionMode::Default;
+                // Suppress future EnterPlanMode popups this session
+                self.state.plan_mode_enter_rejected = true;
+
+                let mut msg = ChatMessage::assistant_empty();
+                msg.append_text("Skipping plan mode. Starting implementation...");
+                self.state.messages.push(msg);
+                self.state.auto_scroll = true;
+                self.state.scroll_offset = 0;
+
+                // Tell the model not to call EnterPlanMode again
+                self.state.pending_system_reminder = Some(
+                    "<system-reminder>\n\
+                     The user declined plan mode. Do NOT call EnterPlanMode again.\n\
+                     Proceed directly with implementation.\n\
+                     </system-reminder>".to_string()
+                );
+
+                // Resume agent with rejection
+                self.send_to_agent("No, don't enter plan mode. Start implementing directly.".to_string(), event_tx);
+            }
+            PlanModeAction::ApproveAcceptEdits => {
+                self.state.plan_mode_exit_handled = true;
+                self.complete_plan_exit(PermissionMode::AcceptEdits);
+                self.send_to_agent("Implement the plan.".to_string(), event_tx);
+            }
+            PlanModeAction::ApproveManual => {
+                self.state.plan_mode_exit_handled = true;
+                self.complete_plan_exit(PermissionMode::Default);
+                self.send_to_agent("Implement the plan.".to_string(), event_tx);
+            }
+            PlanModeAction::KeepPlanning => {
+                // Reset exit flag — model will call ExitPlanMode again after revising
+                self.state.plan_mode_exit_handled = false;
+                // Plan mode was already restored by undo_exit_plan_mode in the event handler.
+                // Same plan file is preserved — no need to re-enter.
+                self.state.permission_mode = PermissionMode::Plan;
+
+                // Set system reminder for the feedback turn
+                let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                self.state.pending_system_reminder = Some(format!(
+                    "<system-reminder>\n\
+                     ## Back in Plan Mode\n\n\
+                     The user rejected your plan and wants changes. You are back in plan mode.\n\
+                     Update your plan at {} based on the user's feedback below.\n\
+                     When done, call ExitPlanMode again.\n\
+                     </system-reminder>",
+                    plan_file.display()
+                ));
+
+                // Let the user type feedback — don't auto-submit
+                // The input bar is now active for typing
+            }
+        }
+    }
+
+    /// Complete plan exit: clear history, restore mode, set system-reminder.
+    fn complete_plan_exit(&mut self, target_mode: PermissionMode) {
+        let plan_file_path = self.state.pending_plan_file.take().unwrap_or_default();
+        let plan_content = self.state.pending_plan_content.take().unwrap_or_default();
+
+        // Clear stale plan mode conversation context
+        self.agent.clear_history();
+
+        // Exit plan mode properly (restores previous permission mode)
+        if strands_tools::utility::plan_state::is_in_plan_mode() {
+            let _ = strands_tools::utility::plan_state::exit_plan_mode(None);
+        }
+        self.state.permission_mode = target_mode.clone();
+
+        // Prepare implementation prompt for next turn
+        if !plan_content.trim().is_empty() {
+            self.state.pending_system_reminder = Some(format!(
+                "<system-reminder>\n\
+                 ## Exited Plan Mode\n\n\
+                 You have exited plan mode. You can now make edits, run tools, and take actions.\n\
+                 Permission mode: {}. {}\n\
+                 The plan file is located at {} if you need to reference it.\n\
+                 </system-reminder>\n\n\
+                 Implement the following plan:\n\n{}",
+                target_mode.label(),
+                if target_mode == PermissionMode::AcceptEdits {
+                    "File edits will be auto-accepted."
+                } else {
+                    "Each edit requires manual approval."
+                },
+                plan_file_path,
+                plan_content.trim()
+            ));
+        } else {
+            self.state.pending_system_reminder = Some(format!(
+                "<system-reminder>\n\
+                 ## Exited Plan Mode\n\n\
+                 You have exited plan mode. You can now make edits, run tools, and take actions.\n\
+                 The plan file is located at {} if you need to reference it.\n\
+                 </system-reminder>",
+                plan_file_path
+            ));
+        }
+    }
+
+    /// Send a message to the agent (extracted from submit() for reuse by plan mode actions).
+    fn send_to_agent(&mut self, prompt: String, event_tx: UnboundedSender<Event>) {
+        self.state.turn_count += 1;
+        self.state.messages.push(ChatMessage::assistant_empty());
+        self.state.agent_status = AgentStatus::Streaming;
+        self.state.streaming_md_cache = None;
+        self.state.auto_scroll = true;
+        self.state.scroll_offset = 0;
+
+        // Prepend any pending system-reminder
+        let agent_prompt = if let Some(reminder) = self.state.pending_system_reminder.take() {
+            format!("{}\n\n{}", reminder, prompt)
+        } else {
+            prompt
+        };
+
+        // Reset cancel signal and store agent clone for cancellation
+        self.agent.reset_cancel();
+        self.state.cancel_agent = Some(self.agent.clone());
+
+        let agent = self.agent.clone();
+        tokio::spawn(async move {
+            Self::run_agent_stream(agent, &agent_prompt, event_tx).await;
+        });
+    }
+
     /// Resume a session by loading its messages and replacing current conversation.
     pub fn resume_session(
         &mut self,
@@ -1317,11 +1593,25 @@ impl TuiApp {
                                         .unwrap_or("")
                                         .to_string();
 
-                                    // ExitPlanMode should abort the agent loop (matching Claude Code's
-                                    // cancelAndAbort behavior). The plan is on disk for the CLI to show.
+                                    // EnterPlanMode: cancel agent and break immediately to stop
+                                    // all further tool execution while awaiting user confirmation.
+                                    if tool_name == "EnterPlanMode" && status == "success" {
+                                        agent.cancel();
+                                        let _ = event_tx.send(Event::EnterPlanModeRequested);
+                                        break; // AgentDone sent after loop
+                                    }
+
+                                    // ExitPlanMode: cancel agent and break immediately to stop
+                                    // all further tool execution while awaiting user approval.
                                     if tool_name == "ExitPlanMode" && status == "success" {
                                         agent.cancel();
-                                        let _ = event_tx.send(Event::PlanModeExited);
+                                        let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                                        let plan_content = std::fs::read_to_string(&plan_file).unwrap_or_default();
+                                        let _ = event_tx.send(Event::PlanModeExitRequested {
+                                            plan_content,
+                                            plan_file: plan_file.display().to_string(),
+                                        });
+                                        break; // AgentDone sent after loop
                                     }
 
                                     Some(Event::AgentToolResult { status, content })
@@ -1404,6 +1694,8 @@ impl TuiApp {
                     model_id: None,
                     session_id: None,
                     rewind_info: Some((i, message_id)),
+                    plan_mode_action: None,
+                    no_slash_prefix: false,
                 });
             }
         }
@@ -1568,32 +1860,54 @@ impl TuiApp {
 
                 }
             }
-            Event::PlanModeExited => {
-                // Matching Claude Code's clear-context path after ExitPlanMode:
-                // 1. Read the plan from disk
-                // 2. Clear agent conversation history (removes stale plan mode system-reminder)
-                // 3. Display the plan to the user
-                // 4. Exit plan mode and restore previous permission mode
-                // 5. Set pending system-reminder with plan context for next turn
-
-                let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
-                let plan_content = std::fs::read_to_string(&plan_file).unwrap_or_default();
-
-                // Clear stale plan mode conversation context
-                self.agent.clear_history();
-
-                // Exit plan mode properly (restores previous permission mode)
+            Event::EnterPlanModeRequested => {
+                // Undo the tool's side-effect immediately — matching TypeScript where
+                // the tool doesn't execute until user approves.
                 if strands_tools::utility::plan_state::is_in_plan_mode() {
                     let _ = strands_tools::utility::plan_state::exit_plan_mode(None);
                 }
-                self.state.permission_mode = PermissionMode::Default;
+
+                if self.state.plan_mode_enter_rejected {
+                    // User already rejected plan mode this session — don't ask again.
+                    // (AgentDone will fire from the cancelled stream)
+                    return;
+                }
+
+                // Model wants to enter plan mode — show inline suggestions for user to confirm/reject.
+                self.state.agent_status = AgentStatus::Idle;
+                self.state.cancel_agent = None;
+                self.agent.reset_cancel();
+
+                let mut msg = ChatMessage::assistant_empty();
+                msg.append_text("Claude wants to enter **plan mode** to explore and design an implementation approach.\n\nIn plan mode, Claude will:\n- Explore the codebase thoroughly\n- Identify existing patterns\n- Design an implementation strategy\n- Present a plan for your approval\n\nNo code changes will be made until you approve the plan.");
+                self.state.messages.push(msg);
+                self.state.auto_scroll = true;
+                self.state.scroll_offset = 0;
+
+                self.show_enter_plan_suggestions();
+            }
+            Event::PlanModeExitRequested { plan_content, plan_file } => {
+                if self.state.plan_mode_exit_handled {
+                    // Already handled (duplicate event from cancelled stream) — ignore.
+                    return;
+                }
+
+                // Undo the tool's side-effect immediately — matching TypeScript where
+                // the tool doesn't execute until user approves. Re-enter plan mode
+                // with the same plan file so state is consistent during the popup.
+                let _ = strands_tools::utility::plan_state::undo_exit_plan_mode(&plan_file);
+
+                // Model has finished planning — show plan + inline suggestions for approval.
+                self.state.agent_status = AgentStatus::Idle;
+                self.state.cancel_agent = None;
+                self.agent.reset_cancel();
 
                 // Show plan to user
                 if !plan_content.trim().is_empty() {
                     let mut msg = ChatMessage::assistant_empty();
                     msg.append_text(&format!(
-                        "**Plan** ({})\n\n{}\n\n---\n*Type your message to approve and start implementation, or provide feedback to update the plan.*",
-                        plan_file.display(),
+                        "**Ready to code?**\n\n**Plan** ({})\n\n{}\n\n---\n*Select an option below to approve or continue planning.*",
+                        plan_file,
                         plan_content.trim()
                     ));
                     self.state.messages.push(msg);
@@ -1601,29 +1915,11 @@ impl TuiApp {
                     self.state.scroll_offset = 0;
                 }
 
-                // Prepare implementation prompt for next turn (matches Claude Code's
-                // "Implement the following plan:" initialMessage with clearContext).
-                if !plan_content.trim().is_empty() {
-                    self.state.pending_system_reminder = Some(format!(
-                        "<system-reminder>\n\
-                         ## Exited Plan Mode\n\n\
-                         You have exited plan mode. You can now make edits, run tools, and take actions.\n\
-                         The plan file is located at {} if you need to reference it.\n\
-                         </system-reminder>\n\n\
-                         Implement the following plan:\n\n{}",
-                        plan_file.display(),
-                        plan_content.trim()
-                    ));
-                } else {
-                    self.state.pending_system_reminder = Some(format!(
-                        "<system-reminder>\n\
-                         ## Exited Plan Mode\n\n\
-                         You have exited plan mode. You can now make edits, run tools, and take actions.\n\
-                         The plan file is located at {} if you need to reference it.\n\
-                         </system-reminder>",
-                        plan_file.display()
-                    ));
-                }
+                // Store plan for later use by complete_plan_exit
+                self.state.pending_plan_content = Some(plan_content);
+                self.state.pending_plan_file = Some(plan_file);
+
+                self.show_exit_plan_suggestions();
             }
             Event::AgentDone => {
                 self.state.agent_status = AgentStatus::Idle;
