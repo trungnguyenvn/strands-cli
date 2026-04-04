@@ -99,16 +99,8 @@ fn status_bar_shows_command_hints_when_idle() {
     let last_line = &lines[lines.len() - 1];
 
     assert!(
-        last_line.contains("/help"),
-        "Status bar should show /help, got: {last_line}"
-    );
-    assert!(
-        last_line.contains("/clear"),
-        "Status bar should show /clear, got: {last_line}"
-    );
-    assert!(
-        last_line.contains("/exit"),
-        "Status bar should show /exit, got: {last_line}"
+        last_line.contains("? for shortcuts"),
+        "Status bar should show '? for shortcuts', got: {last_line}"
     );
 }
 
@@ -121,12 +113,12 @@ fn status_bar_shows_cancel_hint_when_streaming() {
     let last_line = &lines[lines.len() - 1];
 
     assert!(
-        last_line.contains("Ctrl+C"),
-        "Status bar should show Ctrl+C during streaming, got: {last_line}"
+        last_line.contains("esc to interrupt"),
+        "Status bar should show 'esc to interrupt' during streaming, got: {last_line}"
     );
     assert!(
-        !last_line.contains("/help"),
-        "Status bar should NOT show /help during streaming, got: {last_line}"
+        !last_line.contains("? for shortcuts"),
+        "Status bar should NOT show '? for shortcuts' during streaming, got: {last_line}"
     );
 }
 
@@ -763,14 +755,15 @@ fn disabled_command_treated_as_unknown() {
 
 #[test]
 fn status_bar_shows_bottom_when_auto_scroll() {
+    // When auto_scroll is on, the scroll indicator should NOT appear (clean bar)
     let mut state = make_state(100, 24);
     state.auto_scroll = true;
     let buf = render_to_buffer(&mut state, 100, 24);
     let lines = buffer_lines(&buf);
     let last = &lines[lines.len() - 1];
     assert!(
-        last.contains("bottom") || last.contains("\u{2193}"),
-        "Status bar should show 'bottom' indicator when auto_scroll, got: {last}"
+        !last.contains("↑"),
+        "Status bar should not show scroll-up indicator when auto_scroll, got: {last}"
     );
 }
 

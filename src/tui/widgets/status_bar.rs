@@ -1,7 +1,7 @@
-//! Status bar widget — model name, status, turn count, scroll position, key hints.
+//! Status bar widget — model name, contextual hints, turn count, scroll position.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -11,60 +11,20 @@ use crate::tui::app::{AgentStatus, AppState, McpStatus};
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
-    let spinner = match &state.agent_status {
-        AgentStatus::Streaming => {
-            let frame_char = SPINNER_FRAMES[state.tick_count % SPINNER_FRAMES.len()];
-            Span::styled(
-                format!(" {} ", frame_char),
-                Style::default().fg(Color::Cyan),
-            )
-        }
-        _ => Span::raw("   "),
-    };
+    let sep = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
 
-    let status_text = match &state.agent_status {
-        AgentStatus::Idle => Span::styled("ready", Style::default().fg(Color::DarkGray)),
+    // Left side: contextual hint (like Claude Code's PromptInputFooterLeftSide)
+    let hint = match &state.agent_status {
         AgentStatus::Streaming => Span::styled(
-            "streaming...",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AgentStatus::Error(e) => {
-            let msg = if e.len() > 40 {
-                format!("{}...", &e[..40])
-            } else {
-                e.clone()
-            };
-            Span::styled(msg, Style::default().fg(Color::Red))
-        }
-    };
-
-    let turn_info = Span::styled(
-        format!(" {} turns ", state.turn_count),
-        Style::default().fg(Color::DarkGray),
-    );
-
-    let scroll_info = if state.auto_scroll || state.total_lines == 0 {
-        Span::styled(" \u{2193} bottom ", Style::default().fg(Color::DarkGray))
-    } else {
-        let pct = 100u16.saturating_sub(
-            (state.scroll_offset as u32 * 100 / state.total_lines.max(1) as u32) as u16,
-        )
-        .min(100);
-        Span::styled(
-            format!(" \u{2191} {}% ", pct),
-            Style::default().fg(Color::Yellow),
-        )
-    };
-
-    let key_hints = match &state.agent_status {
-        AgentStatus::Streaming => Span::styled(
-            " Ctrl+C/Esc cancel ",
+            " esc to interrupt",
             Style::default().fg(Color::DarkGray),
         ),
-        _ => Span::styled(
-            " pgup/pgdn scroll \u{2502} /help \u{2502} /clear \u{2502} /exit ",
+        AgentStatus::Error(_) => Span::styled(
+            " enter to retry",
+            Style::default().fg(Color::DarkGray),
+        ),
+        AgentStatus::Idle => Span::styled(
+            " ? for shortcuts",
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -73,43 +33,66 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         McpStatus::Loading => {
             let frame_char = SPINNER_FRAMES[state.tick_count % SPINNER_FRAMES.len()];
             Span::styled(
-                format!(" {} MCP connecting... ", frame_char),
+                format!("{} MCP connecting…", frame_char),
                 Style::default().fg(Color::Yellow),
             )
         }
         McpStatus::Warning { failed, .. } => Span::styled(
-            format!(" MCP: {} failed ", failed),
+            format!("MCP: {} failed", failed),
             Style::default().fg(Color::Red),
         ),
         McpStatus::None => Span::raw(""),
     };
 
-    let sep = Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray));
-
-    let mut spans = vec![
+    let turn_info = if state.turn_count > 0 {
         Span::styled(
-            format!(" {} ", state.model_name),
+            format!("{} turns", state.turn_count),
             Style::default().fg(Color::DarkGray),
-        ),
-        sep.clone(),
-        spinner,
-        status_text,
-    ];
+        )
+    } else {
+        Span::raw("")
+    };
+
+    let scroll_info = if !state.auto_scroll && state.total_lines > 0 {
+        let pct = 100u16.saturating_sub(
+            (state.scroll_offset as u32 * 100 / state.total_lines.max(1) as u32) as u16,
+        )
+        .min(100);
+        Span::styled(
+            format!("↑ {}%", pct),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        Span::raw("")
+    };
+
+    let model = Span::styled(
+        format!(" {}", state.model_name),
+        Style::default().fg(Color::DarkGray),
+    );
+
+    // Build spans: hint | model | mcp? | turns? | scroll?
+    let mut spans = vec![hint];
+
+    spans.push(sep.clone());
+    spans.push(model);
+
     if !matches!(state.mcp_status, McpStatus::None) {
         spans.push(sep.clone());
         spans.push(mcp_span);
     }
-    spans.extend([
-        sep.clone(),
-        turn_info,
-        sep.clone(),
-        scroll_info,
-        sep,
-        key_hints,
-    ]);
+
+    if state.turn_count > 0 {
+        spans.push(sep.clone());
+        spans.push(turn_info);
+    }
+
+    if !state.auto_scroll && state.total_lines > 0 {
+        spans.push(sep);
+        spans.push(scroll_info);
+    }
 
     let line = Line::from(spans);
-
     let bar = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
     frame.render_widget(bar, area);
 }

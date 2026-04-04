@@ -127,10 +127,12 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
     use crossterm::event::MouseEventKind;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
+            app.state.selection = Default::default(); // clear selection on scroll
             app.state.auto_scroll = false;
             app.state.scroll_offset = app.state.scroll_offset.saturating_add(3);
         }
         MouseEventKind::ScrollDown => {
+            app.state.selection = Default::default(); // clear selection on scroll
             if app.state.scroll_offset <= 3 {
                 app.state.scroll_offset = 0;
                 app.state.auto_scroll = true;
@@ -138,8 +140,45 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
                 app.state.scroll_offset = app.state.scroll_offset.saturating_sub(3);
             }
         }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let area = app.state.selection.messages_area;
+            if mouse.row >= area.y && mouse.row < area.y + area.height
+                && mouse.column >= area.x && mouse.column < area.x + area.width
+            {
+                app.state.selection.active = true;
+                app.state.selection.anchor = (mouse.row, mouse.column);
+                app.state.selection.end = (mouse.row, mouse.column);
+            }
+        }
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            if app.state.selection.active {
+                app.state.selection.end = (mouse.row, mouse.column);
+            }
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            if app.state.selection.active {
+                app.state.selection.end = (mouse.row, mouse.column);
+                app.state.selection.active = false;
+
+                let text = app.state.selection.selected_text();
+                if !text.is_empty() {
+                    copy_to_clipboard_osc52(&text);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Copy text to clipboard using OSC 52 escape sequence.
+/// Works in most modern terminals including over SSH.
+fn copy_to_clipboard_osc52(text: &str) {
+    use std::io::Write;
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // Write OSC 52 to stderr (where the terminal is)
+    let _ = write!(std::io::stderr(), "\x1b]52;c;{}\x07", encoded);
+    let _ = std::io::stderr().flush();
 }
 
 fn handle_key(

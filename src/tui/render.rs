@@ -9,6 +9,7 @@ use super::widgets::{input_bar, messages, status_bar, suggestions};
 pub fn view(frame: &mut Frame, state: &mut AppState) {
     let terminal_height = frame.area().height;
     let input_h = input_bar::input_height(state, terminal_height);
+    let fly_h = input_bar::fly_status_height(state);
 
     // Reserve space for suggestion dropdown between messages and input
     let suggestion_count = state.suggestions.len().min(6) as u16;
@@ -21,6 +22,7 @@ pub fn view(frame: &mut Frame, state: &mut AppState) {
     let chunks = Layout::vertical([
         Constraint::Fill(1),                    // message history
         Constraint::Length(suggestion_h),        // autocomplete dropdown
+        Constraint::Length(fly_h),               // fly status (streaming/error)
         Constraint::Length(input_h),             // input bar
         Constraint::Length(1),                   // status bar
     ])
@@ -35,7 +37,9 @@ pub fn view(frame: &mut Frame, state: &mut AppState) {
             chunks[1],
         );
     }
-    input_bar::render_input(state, frame, chunks[2]);
-    status_bar::render_status_bar(state, frame, chunks[3]);
-
+    if fly_h > 0 {
+        input_bar::render_fly_status(state, frame, chunks[2]);
+    }
+    input_bar::render_input(state, frame, chunks[3]);
+    status_bar::render_status_bar(state, frame, chunks[4]);
 }

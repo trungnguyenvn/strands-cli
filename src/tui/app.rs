@@ -114,6 +114,80 @@ impl ChatMessage {
     }
 }
 
+/// Text selection state for mouse-based copy.
+#[derive(Clone, Debug, Default)]
+pub struct Selection {
+    /// Whether a selection is in progress (mouse button held).
+    pub active: bool,
+    /// Anchor point (where mouse was pressed): (row, col) in screen coords.
+    pub anchor: (u16, u16),
+    /// Current end point (follows mouse drag): (row, col) in screen coords.
+    pub end: (u16, u16),
+    /// The area of the messages widget (set each render).
+    pub messages_area: ratatui::layout::Rect,
+    /// Rendered text lines from the last render (for text extraction).
+    pub rendered_lines: Vec<String>,
+    /// The y-scroll offset used during the last render.
+    pub rendered_y_scroll: u16,
+}
+
+impl Selection {
+    /// Returns (start, end) normalized so start <= end in reading order.
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor.0 < self.end.0
+            || (self.anchor.0 == self.end.0 && self.anchor.1 <= self.end.1)
+        {
+            (self.anchor, self.end)
+        } else {
+            (self.end, self.anchor)
+        }
+    }
+
+    /// Extract the selected text from rendered_lines.
+    /// Screen columns map to character (not byte) positions since
+    /// ratatui renders one cell per char (wide chars take 2 cells).
+    pub fn selected_text(&self) -> String {
+        if !self.active && self.anchor == self.end {
+            return String::new();
+        }
+        let ((sr, sc), (er, ec)) = self.ordered();
+        let area = self.messages_area;
+
+        // Convert screen coords to line indices relative to rendered content
+        let start_line = (sr.saturating_sub(area.y) + self.rendered_y_scroll) as usize;
+        let end_line = (er.saturating_sub(area.y) + self.rendered_y_scroll) as usize;
+
+        let mut result = String::new();
+        for (i, line_idx) in (start_line..=end_line).enumerate() {
+            if line_idx >= self.rendered_lines.len() {
+                break;
+            }
+            let line = &self.rendered_lines[line_idx];
+            let char_count = line.chars().count();
+            let col_start = if i == 0 {
+                sc.saturating_sub(area.x) as usize
+            } else {
+                0
+            };
+            let col_end = if line_idx == end_line {
+                (ec.saturating_sub(area.x) as usize + 1).min(char_count)
+            } else {
+                char_count
+            };
+
+            if col_start < char_count {
+                let end = col_end.min(char_count);
+                let substr: String = line.chars().skip(col_start).take(end - col_start).collect();
+                result.push_str(&substr);
+            }
+            if line_idx < end_line {
+                result.push('\n');
+            }
+        }
+        result.trim_end().to_string()
+    }
+}
+
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub scroll_offset: u16,
@@ -141,13 +215,15 @@ pub struct AppState {
     pub mcp_servers: Vec<crate::mcp::McpServerInfo>,
     /// MCP loading status for the status bar.
     pub mcp_status: McpStatus,
+    /// Text selection state for mouse copy.
+    pub selection: Selection,
 }
 
 impl AppState {
     pub fn new(model_name: String, command_registry: CommandRegistry, mcp_servers: Vec<crate::mcp::McpServerInfo>) -> Self {
         let mut input = tui_textarea::TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
-        input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
+        input.set_placeholder_text(" ");
         let terminal_width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
         Self {
             messages: Vec::new(),
@@ -170,6 +246,7 @@ impl AppState {
             selected_suggestion: -1,
             mcp_servers,
             mcp_status: McpStatus::Loading,
+            selection: Selection::default(),
         }
     }
 }
@@ -447,7 +524,7 @@ impl TuiApp {
     pub fn reset_input(&mut self) {
         self.state.input = tui_textarea::TextArea::default();
         self.state.input.set_cursor_line_style(ratatui::style::Style::default());
-        self.state.input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
+        self.state.input.set_placeholder_text("/help");
         self.state.suggestions.clear();
         self.state.selected_suggestion = -1;
     }
@@ -456,7 +533,7 @@ impl TuiApp {
     fn set_input(&mut self, text: &str) {
         self.state.input = tui_textarea::TextArea::default();
         self.state.input.set_cursor_line_style(ratatui::style::Style::default());
-        self.state.input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
+        self.state.input.set_placeholder_text("/help");
         for ch in text.chars() {
             self.state.input.insert_char(ch);
         }
