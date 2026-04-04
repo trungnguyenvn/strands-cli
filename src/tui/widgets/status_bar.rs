@@ -30,6 +30,10 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
                 " esc to interrupt",
                 Style::default().fg(Color::DarkGray),
             ),
+            AgentStatus::Error(ref e) if e.contains("context") || e.contains("413") || e.contains("prompt_too_long") => Span::styled(
+                " /compact to continue",
+                Style::default().fg(Color::Red),
+            ),
             AgentStatus::Error(_) => Span::styled(
                 " enter to retry",
                 Style::default().fg(Color::DarkGray),
@@ -115,6 +119,21 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
     if state.turn_count > 0 {
         spans.push(sep.clone());
         spans.push(turn_info);
+    }
+
+    // Context window usage indicator (matching Claude Code)
+    if let Some(pct) = state.context_percent_used {
+        if pct > 50.0 {
+            let (color, label) = if state.context_critical {
+                (Color::Red, format!("ctx {:.0}%", pct))
+            } else if state.context_warning {
+                (Color::Yellow, format!("ctx {:.0}%", pct))
+            } else {
+                (Color::DarkGray, format!("ctx {:.0}%", pct))
+            };
+            spans.push(sep.clone());
+            spans.push(Span::styled(label, Style::default().fg(color)));
+        }
     }
 
     if !state.auto_scroll && state.total_lines > 0 {

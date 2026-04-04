@@ -112,6 +112,21 @@ impl ChatMessage {
             }
         }
     }
+
+    /// Extract all text content from this message's blocks.
+    pub fn text_content(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::Text(t) = b {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
 }
 
 /// Text selection state for mouse-based copy.
@@ -315,6 +330,19 @@ pub struct AppState {
     pub last_ctrl_c_tick: Option<usize>,
     /// Current permission mode (cycles via Shift+Tab).
     pub permission_mode: PermissionMode,
+
+    // --- Context window tracking (matching Claude Code) ---
+
+    /// Token usage percentage (0.0–100.0). None if not tracking.
+    pub context_percent_used: Option<f64>,
+    /// True if above warning threshold (~90% context used).
+    pub context_warning: bool,
+    /// True if at hard blocking limit (~98% context used).
+    pub context_critical: bool,
+    /// Raw token counts: (used, limit).
+    pub token_counts: Option<(u64, u64)>,
+    /// Whether the current stream is a /compact — on completion, replace history.
+    pub pending_compact: bool,
 }
 
 /// Permission modes matching Claude Code's Shift+Tab cycle.
@@ -418,6 +446,11 @@ impl AppState {
             keybindings,
             last_ctrl_c_tick: None,
             permission_mode: PermissionMode::Default,
+            context_percent_used: None,
+            context_warning: false,
+            context_critical: false,
+            token_counts: None,
+            pending_compact: false,
         }
     }
 
@@ -532,6 +565,25 @@ impl TuiApp {
                 }
                 DispatchResult::Prompt(expanded) => {
                     // Show the original command as user message, send expanded prompt to model
+                    self.state.messages.push(ChatMessage::user(trimmed.to_string()));
+                    self.state.messages.push(ChatMessage::assistant_empty());
+                    self.state.agent_status = AgentStatus::Streaming;
+                    self.state.streaming_md_cache = None;
+                    self.state.auto_scroll = true;
+                    self.state.scroll_offset = 0;
+                    self.state.turn_count += 1;
+                    self.reset_input();
+                    self.agent.reset_cancel();
+                    self.state.cancel_agent = Some(self.agent.clone());
+                    let agent = self.agent.clone();
+                    tokio::spawn(async move {
+                        Self::run_agent_stream(agent, &expanded, event_tx).await;
+                    });
+                    return;
+                }
+                DispatchResult::CompactPrompt(expanded) => {
+                    // Send summary prompt to model; on AgentDone, replace history with response
+                    self.state.pending_compact = true;
                     self.state.messages.push(ChatMessage::user(trimmed.to_string()));
                     self.state.messages.push(ChatMessage::assistant_empty());
                     self.state.agent_status = AgentStatus::Streaming;
@@ -1002,16 +1054,45 @@ impl TuiApp {
                 self.state.cancel_agent = None;
                 self.agent.reset_cancel();
                 self.state.streaming_md_cache = None;
+                // Handle /compact completion: replace agent history with summary
+                if self.state.pending_compact {
+                    self.state.pending_compact = false;
+                    // Extract summary from the last assistant message
+                    if let Some(msg) = self.state.messages.last() {
+                        let summary_text = msg.text_content();
+                        if !summary_text.is_empty() {
+                            self.agent.replace_history_with_summary(&summary_text);
+                        }
+                    }
+                }
+                // Refresh context window tracking from agent
+                self.state.context_percent_used = self.agent.context_percent_used();
+                self.state.context_warning = self.agent.is_context_warning();
+                self.state.context_critical = self.agent.is_context_critical();
+                self.state.token_counts = self.agent.token_counts();
                 // Bump unseen count for completed turn
                 if !self.state.auto_scroll && self.state.unseen_from_line.is_some() {
                     self.state.unseen_message_count = self.state.unseen_message_count.saturating_add(1);
                 }
             }
             Event::AgentError(e) => {
-                self.state.agent_status = AgentStatus::Error(e.clone());
-                if let Some(msg) = last_msg {
-                    msg.append_text(&format!("\n[Error: {}]", e));
+                // Detect context window overflow (413 / prompt_too_long)
+                let is_context_full = e.contains("prompt_too_long")
+                    || e.contains("413")
+                    || e.contains("ContextWindowOverflow")
+                    || e.contains("context window")
+                    || e.contains("context_length_exceeded");
 
+                if is_context_full {
+                    self.state.agent_status = AgentStatus::Error(e.clone());
+                    if let Some(msg) = last_msg {
+                        msg.append_text("\n[Context window full — type /compact to summarize and continue]");
+                    }
+                } else {
+                    self.state.agent_status = AgentStatus::Error(e.clone());
+                    if let Some(msg) = last_msg {
+                        msg.append_text(&format!("\n[Error: {}]", e));
+                    }
                 }
             }
             _ => {}

@@ -238,6 +238,8 @@ pub enum DispatchResult {
     Local(CommandResult),
     /// A prompt command expanded — send this text to the model.
     Prompt(String),
+    /// A compact prompt — send to model, then replace history with the response.
+    CompactPrompt(String),
     /// The command was not found and the name looks like a command.
     Unknown(String),
     /// The input looked like a file path, not a command — treat as plain text.
@@ -257,7 +259,13 @@ pub fn dispatch(input: &str, registry: &CommandRegistry, context: &CommandContex
                 DispatchResult::Local(execute(&parsed.args, context))
             }
             CommandKind::Prompt { get_prompt } => {
-                DispatchResult::Prompt(get_prompt(&parsed.args, context))
+                let prompt = get_prompt(&parsed.args, context);
+                // /compact gets special handling: replace history after model responds
+                if parsed.command_name == "compact" {
+                    DispatchResult::CompactPrompt(prompt)
+                } else {
+                    DispatchResult::Prompt(prompt)
+                }
             }
         },
         Some(_) => {

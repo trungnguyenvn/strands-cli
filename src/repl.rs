@@ -135,6 +135,19 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                     println!();
                     continue;
                 }
+                DispatchResult::CompactPrompt(expanded) => {
+                    turn_count += 1;
+                    message_count += 2;
+                    if let Err(e) = stream_turn(agent, &expanded).await {
+                        eprintln!("\n{} {}", "error:".red().bold(), e);
+                    } else {
+                        // Replace history with the summary
+                        agent.replace_history_with_summary(&expanded);
+                        println!("{}", "\nConversation compacted.".dimmed());
+                    }
+                    println!();
+                    continue;
+                }
                 DispatchResult::Unknown(name) => {
                     eprintln!(
                         "{} Unknown command: /{}. Type /help for available commands.",

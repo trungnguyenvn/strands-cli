@@ -56,6 +56,14 @@ struct Cli {
     #[arg(long, default_value = "30")]
     max_iterations: usize,
 
+    /// Context window size in tokens (for proactive compaction)
+    #[arg(long, default_value = "200000", env = "STRANDS_CONTEXT_WINDOW")]
+    context_window: u64,
+
+    /// Maximum tokens per model response
+    #[arg(long = "max-tokens", default_value = "16384", env = "STRANDS_MAX_TOKENS")]
+    max_tokens: i32,
+
     /// Run a single prompt (non-interactive, plain output)
     #[arg(long = "prompt")]
     oneshot: Option<String>,
@@ -133,13 +141,22 @@ async fn main() -> Result<()> {
     };
     let system_prompt = prompt::build_effective_system_prompt(source, &render_ctx);
 
-    // Build agent
+    // Build agent with proactive context management
+    let summarizing = Arc::new(
+        strands::agent::conversation_manager::SummarizingConversationManager::new(
+            Some(0.3),  // summary_ratio
+            Some(10),   // preserve_recent_messages
+            None,       // no custom summarization agent
+            None,       // no custom summarization prompt
+        )?
+    );
     let mut builder = Agent::builder()
         .with_model(model)
         .with_system_prompt(system_prompt)
         .with_tools(tools)
         .with_max_iterations(cli.max_iterations)
-        .with_sliding_window(500);
+        .with_conversation_manager(summarizing)
+        .with_proactive_context_management(cli.context_window, cli.max_tokens.max(0) as u64);
 
     // Inject STRANDS.md as initial conversation context
     if let Some(ref user_ctx) = user_ctx {
@@ -173,6 +190,7 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>> {
+    let max_tokens = cli.max_tokens;
     match cli.provider.as_str() {
         "anthropic" => {
             use strands::models::anthropic::{AnthropicConfig, AnthropicModel};
@@ -184,7 +202,7 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
 
             let config = AnthropicConfig {
                 model_id: model_id.clone(),
-                max_tokens: Some(16384),
+                max_tokens: Some(max_tokens),
                 ..Default::default()
             };
 
@@ -200,7 +218,7 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
                 .unwrap_or_else(|| "us.anthropic.claude-sonnet-4-6".to_string());
             let mut config = BedrockConfig::default();
             config.model_id = model_id;
-            config.max_tokens = Some(16384);
+            config.max_tokens = Some(max_tokens);
 
             let model = BedrockModel::new(None, None, Some("us-east-1".to_string()), config).await?;
 
@@ -217,7 +235,7 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
             let api_key = std::env::var("OPENAI_API_KEY").ok();
             let config = OpenAIConfig {
                 model_id: model_id.clone(),
-                max_tokens: Some(16384),
+                max_tokens: Some(max_tokens),
                 ..Default::default()
             };
 
@@ -324,11 +342,19 @@ pub async fn build_model_by_id(model_id: &str) -> Result<Arc<dyn strands::types:
     build_anthropic_model(model_id).await
 }
 
+/// Read max_tokens from env or use default (for runtime model switching).
+fn runtime_max_tokens() -> i32 {
+    std::env::var("STRANDS_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16384)
+}
+
 async fn build_anthropic_model(model_id: &str) -> Result<Arc<dyn strands::types::models::Model>> {
     use strands::models::anthropic::{AnthropicConfig, AnthropicModel};
     let config = AnthropicConfig {
         model_id: model_id.to_string(),
-        max_tokens: Some(16384),
+        max_tokens: Some(runtime_max_tokens()),
         ..Default::default()
     };
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
@@ -340,7 +366,7 @@ async fn build_bedrock_model(model_id: &str) -> Result<Arc<dyn strands::types::m
     use strands::models::bedrock::{BedrockConfig, BedrockModel};
     let mut config = BedrockConfig::default();
     config.model_id = model_id.to_string();
-    config.max_tokens = Some(16384);
+    config.max_tokens = Some(runtime_max_tokens());
     let model = BedrockModel::new(None, None, Some("us-east-1".to_string()), config).await?;
     Ok(Arc::new(model))
 }
@@ -350,7 +376,7 @@ async fn build_openai_model(model_id: &str) -> Result<Arc<dyn strands::types::mo
     let api_key = std::env::var("OPENAI_API_KEY").ok();
     let config = OpenAIConfig {
         model_id: model_id.to_string(),
-        max_tokens: Some(16384),
+        max_tokens: Some(runtime_max_tokens()),
         ..Default::default()
     };
     let model = OpenAIModel::new(Some(model_id.to_string()), api_key, None, Some(config)).await?;

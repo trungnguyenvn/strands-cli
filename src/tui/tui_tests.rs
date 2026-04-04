@@ -615,13 +615,13 @@ fn slash_compact_returns_prompt() {
     };
 
     match crate::commands::dispatch("/compact", &state.command_registry, &ctx) {
-        crate::commands::DispatchResult::Prompt(prompt) => {
+        crate::commands::DispatchResult::CompactPrompt(prompt) => {
             assert!(
                 prompt.contains("Summarize"),
                 "Compact prompt should contain 'Summarize', got: {prompt}"
             );
         }
-        _ => panic!("Expected Prompt for /compact"),
+        _ => panic!("Expected CompactPrompt for /compact"),
     }
 }
 
@@ -637,13 +637,13 @@ fn slash_compact_with_args_includes_custom_instructions() {
     };
 
     match crate::commands::dispatch("/compact keep all file paths", &state.command_registry, &ctx) {
-        crate::commands::DispatchResult::Prompt(prompt) => {
+        crate::commands::DispatchResult::CompactPrompt(prompt) => {
             assert!(
                 prompt.contains("keep all file paths"),
                 "Compact prompt should include custom args, got: {prompt}"
             );
         }
-        _ => panic!("Expected Prompt for /compact with args"),
+        _ => panic!("Expected CompactPrompt for /compact with args"),
     }
 }
 

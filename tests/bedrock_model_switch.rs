@@ -55,84 +55,98 @@ async fn single_turn(agent: &Agent, prompt: &str) -> String {
 
 /// Claude Sonnet 4.6
 #[tokio::test]
+#[ignore] // requires AWS credentials — run with: cargo test --test bedrock_model_switch -- --ignored
 async fn build_bedrock_claude_sonnet_46() {
     let _model = make_bedrock_model("us.anthropic.claude-sonnet-4-6").await;
 }
 
 /// Claude Opus 4.6
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_claude_opus_46() {
     let _model = make_bedrock_model("us.anthropic.claude-opus-4-6-v1").await;
 }
 
 /// Claude Haiku 4.5
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_claude_haiku_45() {
     let _model = make_bedrock_model("us.anthropic.claude-haiku-4-5-20251001-v1:0").await;
 }
 
 /// Claude Sonnet 4
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_claude_sonnet_4() {
     let _model = make_bedrock_model("us.anthropic.claude-sonnet-4-20250514-v1:0").await;
 }
 
 /// Claude Opus 4
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_claude_opus_4() {
     let _model = make_bedrock_model("us.anthropic.claude-opus-4-20250514-v1:0").await;
 }
 
 /// Claude Sonnet 4.5
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_claude_sonnet_45() {
     let _model = make_bedrock_model("us.anthropic.claude-sonnet-4-5-20250929-v1:0").await;
 }
 
 /// Amazon Nova Pro
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_nova_pro() {
     let _model = make_bedrock_model("us.amazon.nova-pro-v1:0").await;
 }
 
 /// Amazon Nova Lite
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_nova_lite() {
     let _model = make_bedrock_model("us.amazon.nova-lite-v1:0").await;
 }
 
 /// Amazon Nova Micro
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_nova_micro() {
     let _model = make_bedrock_model("us.amazon.nova-micro-v1:0").await;
 }
 
 /// Amazon Nova Premier
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_nova_premier() {
     let _model = make_bedrock_model("us.amazon.nova-premier-v1:0").await;
 }
 
 /// Meta Llama 4 Scout
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_llama4_scout() {
     let _model = make_bedrock_model("us.meta.llama4-scout-17b-instruct-v1:0").await;
 }
 
 /// Meta Llama 4 Maverick
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_llama4_maverick() {
     let _model = make_bedrock_model("us.meta.llama4-maverick-17b-instruct-v1:0").await;
 }
 
 /// Meta Llama 3.3 70B
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_llama33_70b() {
     let _model = make_bedrock_model("us.meta.llama3-3-70b-instruct-v1:0").await;
 }
 
 /// Mistral Pixtral Large
 #[tokio::test]
+#[ignore]
 async fn build_bedrock_mistral_pixtral() {
     let _model = make_bedrock_model("us.mistral.pixtral-large-2502-v1:0").await;
 }
@@ -143,6 +157,7 @@ async fn build_bedrock_mistral_pixtral() {
 
 /// Claude Sonnet 4.6 — math question
 #[tokio::test]
+#[ignore]
 async fn chat_claude_sonnet_46() {
     let agent = make_test_agent("us.anthropic.claude-sonnet-4-6").await;
     let response = single_turn(&agent, "What is 2+3? Reply with just the number.").await;
@@ -153,6 +168,7 @@ async fn chat_claude_sonnet_46() {
 
 /// Claude Opus 4.6 — math question
 #[tokio::test]
+#[ignore]
 async fn chat_claude_opus_46() {
     let agent = make_test_agent("us.anthropic.claude-opus-4-6-v1").await;
     let response = single_turn(&agent, "What is 2+3? Reply with just the number.").await;
@@ -163,6 +179,7 @@ async fn chat_claude_opus_46() {
 
 /// Claude Haiku 4.5 — capital city question
 #[tokio::test]
+#[ignore]
 async fn chat_claude_haiku_45() {
     let agent = make_test_agent("us.anthropic.claude-haiku-4-5-20251001-v1:0").await;
     let response = single_turn(&agent, "What is the capital of France? One word.").await;
@@ -173,6 +190,7 @@ async fn chat_claude_haiku_45() {
 
 /// Claude Sonnet 4 — color question
 #[tokio::test]
+#[ignore]
 async fn chat_claude_sonnet_4() {
     let agent = make_test_agent("us.anthropic.claude-sonnet-4-20250514-v1:0").await;
     let response = single_turn(&agent, "What color is the sky on a clear day? One word.").await;
@@ -183,6 +201,7 @@ async fn chat_claude_sonnet_4() {
 
 /// Claude Sonnet 4.5 — math
 #[tokio::test]
+#[ignore]
 async fn chat_claude_sonnet_45() {
     let agent = make_test_agent("us.anthropic.claude-sonnet-4-5-20250929-v1:0").await;
     let response = single_turn(&agent, "What is 10-3? Reply with just the number.").await;
@@ -193,6 +212,7 @@ async fn chat_claude_sonnet_45() {
 
 /// Amazon Nova Micro — math
 #[tokio::test]
+#[ignore]
 async fn chat_nova_micro() {
     let agent = make_test_agent("us.amazon.nova-micro-v1:0").await;
     let response = single_turn(&agent, "What is 2+3? Reply with just the number.").await;
@@ -203,6 +223,7 @@ async fn chat_nova_micro() {
 
 /// Amazon Nova Lite — capital city
 #[tokio::test]
+#[ignore]
 async fn chat_nova_lite() {
     let agent = make_test_agent("us.amazon.nova-lite-v1:0").await;
     let response = single_turn(&agent, "What is the capital of Japan? One word.").await;
@@ -213,6 +234,7 @@ async fn chat_nova_lite() {
 
 /// Amazon Nova Pro — math
 #[tokio::test]
+#[ignore]
 async fn chat_nova_pro() {
     let agent = make_test_agent("us.amazon.nova-pro-v1:0").await;
     let response = single_turn(&agent, "What is 7*8? Reply with just the number.").await;
@@ -224,6 +246,7 @@ async fn chat_nova_pro() {
 
 /// Meta Llama 4 Scout — math
 #[tokio::test]
+#[ignore]
 async fn chat_llama4_scout() {
     let agent = make_test_agent("us.meta.llama4-scout-17b-instruct-v1:0").await;
     let response = single_turn(&agent, "What is 2+3? Reply with just the number.").await;
@@ -234,6 +257,7 @@ async fn chat_llama4_scout() {
 
 /// Meta Llama 4 Maverick — capital city
 #[tokio::test]
+#[ignore]
 async fn chat_llama4_maverick() {
     let agent = make_test_agent("us.meta.llama4-maverick-17b-instruct-v1:0").await;
     let response = single_turn(&agent, "What is the capital of Germany? One word.").await;
@@ -244,6 +268,7 @@ async fn chat_llama4_maverick() {
 
 /// Meta Llama 3.3 70B — math
 #[tokio::test]
+#[ignore]
 async fn chat_llama33_70b() {
     let agent = make_test_agent("us.meta.llama3-3-70b-instruct-v1:0").await;
     let response = single_turn(&agent, "What is 9+1? Reply with just the number.").await;
@@ -254,6 +279,7 @@ async fn chat_llama33_70b() {
 
 /// Mistral Pixtral Large — math
 #[tokio::test]
+#[ignore]
 async fn chat_mistral_pixtral() {
     let agent = make_test_agent("us.mistral.pixtral-large-2502-v1:0").await;
     let response = single_turn(&agent, "What is 4+6? Reply with just the number.").await;
@@ -268,6 +294,7 @@ async fn chat_mistral_pixtral() {
 
 /// Haiku → Nova Micro: each answers a different math question correctly.
 #[tokio::test]
+#[ignore]
 async fn swap_haiku_to_nova_micro() {
     let agent = make_test_agent("us.anthropic.claude-haiku-4-5-20251001-v1:0").await;
 
@@ -287,6 +314,7 @@ async fn swap_haiku_to_nova_micro() {
 
 /// Nova Micro → Sonnet 4.6: each answers a capital city question.
 #[tokio::test]
+#[ignore]
 async fn swap_nova_to_sonnet() {
     let agent = make_test_agent("us.amazon.nova-micro-v1:0").await;
 
@@ -308,6 +336,7 @@ async fn swap_nova_to_sonnet() {
 /// 3-way chain: Claude Haiku → Nova Micro → Llama 4 Scout.
 /// Each answers a different simple question to prove the model actually changed.
 #[tokio::test]
+#[ignore]
 async fn swap_chain_claude_nova_llama() {
     let agent = make_test_agent("us.anthropic.claude-haiku-4-5-20251001-v1:0").await;
 
@@ -338,6 +367,7 @@ async fn swap_chain_claude_nova_llama() {
 
 /// 4-way chain: Sonnet 4.6 → Nova Lite → Llama 4 Maverick → Haiku 3.5.
 #[tokio::test]
+#[ignore]
 async fn swap_chain_four_providers() {
     let agent = make_test_agent("us.anthropic.claude-sonnet-4-6").await;
 
