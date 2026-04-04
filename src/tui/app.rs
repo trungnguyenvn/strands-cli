@@ -1005,6 +1005,15 @@ impl TuiApp {
     /// Apply a mode switch from /plan, /default, /accept-edits, /bypass commands
     /// or from Shift+Tab cycling.
     pub fn apply_mode_switch(&mut self, mode_name: &str) {
+        // Clear any pending plan mode decision state — Shift+Tab overrides the popup.
+        if self.state.awaiting_plan_decision.is_some() {
+            self.state.awaiting_plan_decision = None;
+            self.state.suggestions.clear();
+            self.state.selected_suggestion = -1;
+            self.state.pending_plan_content = None;
+            self.state.pending_plan_file = None;
+        }
+
         let (new_mode, tools_mode) = match mode_name {
             "plan" => {
                 if let Err(e) = strands_tools::utility::plan_state::enter_plan_mode(None) {
