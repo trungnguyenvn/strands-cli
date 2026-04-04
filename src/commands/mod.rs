@@ -84,6 +84,8 @@ pub enum CommandResult {
         current_model: String,
         items: Vec<ModelPickerItem>,
     },
+    /// Resume a session by ID. The caller handles async loading.
+    ResumeSession(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +484,19 @@ fn builtin_commands() -> Vec<Command> {
                 get_prompt: Box::new(cmd_compact_prompt),
             },
         },
+        // /resume — session picker (like /model picker)
+        Command {
+            name: "resume".into(),
+            description: "Resume a previous session".into(),
+            aliases: vec![],
+            is_hidden: false,
+            argument_hint: Some("<session>".into()),
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: cmd_resume,
+            },
+        },
         // /session
         Command {
             name: "session".into(),
@@ -582,6 +597,33 @@ fn format_command_line(cmd: &CommandInfo) -> String {
         .map(|h| format!(" {}", h))
         .unwrap_or_default();
     format!("  /{}{}{} — {}", cmd.name, hint, aliases, cmd.description)
+}
+
+fn cmd_resume(args: &str, _ctx: &CommandContext) -> CommandResult {
+    let session_ref = args.trim();
+    if session_ref.is_empty() {
+        // No argument: show session list (suggestions will appear as user types)
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let dir = crate::session::SessionId::storage_dir(&cwd);
+        let sessions = crate::session::list_sessions(&dir);
+        if sessions.is_empty() {
+            return CommandResult::Text("No sessions found. Start a conversation first.".to_string());
+        }
+        let mut lines = vec!["Type `/resume ` to see sessions as suggestions, or pick one:".to_string()];
+        for (i, s) in sessions.iter().take(10).enumerate() {
+            lines.push(format!(
+                "  {} — {} ({} KB, {})",
+                i + 1,
+                s.session_id,
+                s.size_bytes / 1024,
+                s.modified.format("%Y-%m-%d %H:%M"),
+            ));
+        }
+        lines.push("\nUse `/resume <session-id>` or `/resume latest`".to_string());
+        CommandResult::Text(lines.join("\n"))
+    } else {
+        CommandResult::ResumeSession(session_ref.to_string())
+    }
 }
 
 fn cmd_session(args: &str, _ctx: &CommandContext) -> CommandResult {
@@ -1156,6 +1198,9 @@ pub struct SuggestionItem {
     /// When set, this suggestion represents a model choice rather than a command.
     /// Accepting it should trigger a model switch instead of filling the input.
     pub model_id: Option<String>,
+    /// When set, this suggestion represents a session to resume.
+    /// Accepting it should trigger session resume instead of filling the input.
+    pub session_id: Option<String>,
 }
 
 /// Generate command suggestions for a partial input.
@@ -1166,15 +1211,19 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_mod
         return Vec::new();
     }
 
-    // Check if this is a `/model <partial>` input — show model suggestions
+    // Check if this is a `/model <partial>` or `/resume <partial>` input
     if let Some(space_idx) = trimmed.find(' ') {
         let cmd_name = &trimmed[1..space_idx];
         if cmd_name == "model" {
             let query = trimmed[space_idx + 1..].trim().to_lowercase();
             return generate_model_suggestions(&query, current_model);
         }
+        if cmd_name == "resume" {
+            let query = trimmed[space_idx + 1..].trim().to_lowercase();
+            return generate_session_suggestions(&query);
+        }
         // For other commands, don't show suggestions if there are real arguments
-        if trimmed[space_idx + 1..].trim().len() > 0 {
+        if !trimmed[space_idx + 1..].trim().is_empty() {
             return Vec::new();
         }
     }
@@ -1201,6 +1250,7 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_mod
             name: cmd.name.clone(),
             description: cmd.description.clone(),
             model_id: None,
+            session_id: None,
         })
         .collect();
 
@@ -1244,6 +1294,7 @@ fn generate_model_suggestions(query: &str, current_model: &str) -> Vec<Suggestio
                 name: item.alias,
                 description,
                 model_id: Some(item.model_id),
+                session_id: None,
             }
         })
         .collect();
@@ -1263,6 +1314,40 @@ fn generate_model_suggestions(query: &str, current_model: &str) -> Vec<Suggestio
     });
 
     suggestions
+}
+
+fn generate_session_suggestions(query: &str) -> Vec<SuggestionItem> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let dir = crate::session::SessionId::storage_dir(&cwd);
+    let sessions = crate::session::list_sessions(&dir);
+
+    sessions
+        .into_iter()
+        .take(10)
+        .filter(|s| {
+            query.is_empty()
+                || s.session_id.to_lowercase().contains(query)
+        })
+        .map(|s| {
+            let desc = format!(
+                "{} · {}KB",
+                s.modified.format("%Y-%m-%d %H:%M"),
+                s.size_bytes / 1024,
+            );
+            // Show abbreviated ID as the name
+            let abbrev = if s.session_id.len() > 12 {
+                format!("{}…", &s.session_id[..12])
+            } else {
+                s.session_id.clone()
+            };
+            SuggestionItem {
+                name: abbrev,
+                description: desc,
+                model_id: None,
+                session_id: Some(s.session_id),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

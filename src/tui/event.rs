@@ -25,6 +25,8 @@ pub enum Event {
     AgentToolResult { status: String, content: String },
     AgentDone,
     AgentError(String),
+    /// ExitPlanMode succeeded — clear conversation history (matches Claude Code's clear-context path).
+    PlanModeExited,
 
     // MCP lifecycle
     /// MCP servers finished loading in the background.

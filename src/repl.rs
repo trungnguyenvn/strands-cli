@@ -147,6 +147,24 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                     }
                     continue;
                 }
+                DispatchResult::Local(CommandResult::ResumeSession(session_ref)) => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
+                    match crate::session::resolve_and_load(&sessions_dir, &session_ref).await {
+                        Ok((id, msgs)) => {
+                            agent.clear_history();
+                            for m in &msgs {
+                                agent.add_message(m.clone());
+                            }
+                            message_count = msgs.len();
+                            println!("{}", format!("Resumed session {} ({} messages)", id, msgs.len()).green());
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}", "error:".red().bold(), e);
+                        }
+                    }
+                    continue;
+                }
                 DispatchResult::Prompt(expanded) => {
                     turn_count += 1;
                     message_count += 2;
@@ -159,12 +177,13 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                 DispatchResult::CompactPrompt(expanded) => {
                     turn_count += 1;
                     message_count += 2;
-                    if let Err(e) = stream_turn(agent, &expanded).await {
-                        eprintln!("\n{} {}", "error:".red().bold(), e);
-                    } else {
-                        // Replace history with the summary
-                        agent.replace_history_with_summary(&expanded);
-                        println!("{}", "\nConversation compacted.".dimmed());
+                    match stream_turn(agent, &expanded).await {
+                        Ok(_) => {
+                            // Replace history with the summary
+                            agent.replace_history_with_summary(&expanded);
+                            println!("{}", "\nConversation compacted.".dimmed());
+                        }
+                        Err(e) => eprintln!("\n{} {}", "error:".red().bold(), e),
                     }
                     println!();
                     continue;
@@ -193,8 +212,24 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
             input.to_string()
         };
 
-        if let Err(e) = stream_turn(agent, &agent_prompt).await {
-            eprintln!("\n{} {}", "error:".red().bold(), e);
+        match stream_turn(agent, &agent_prompt).await {
+            Ok(did_exit_plan) => {
+                if did_exit_plan {
+                    // Set system context for next turn with plan file reference
+                    let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                    pending_system_reminder = Some(format!(
+                        "<system-reminder>\n\
+                         ## Exited Plan Mode\n\n\
+                         You have exited plan mode. You can now make edits, run tools, and take actions. \
+                         The plan file is located at {} if you need to reference it.\n\
+                         </system-reminder>",
+                        plan_file.display()
+                    ));
+                }
+            }
+            Err(e) => {
+                eprintln!("\n{} {}", "error:".red().bold(), e);
+            }
         }
         println!();
     }
@@ -203,12 +238,14 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
 }
 
 pub async fn run_single_turn(agent: &Agent, prompt: &str) -> strands::Result<()> {
-    stream_turn(agent, prompt).await
+    stream_turn(agent, prompt).await.map(|_| ())
 }
 
-async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<()> {
+/// Returns true if ExitPlanMode was called (plan mode exited during this turn).
+async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<bool> {
     let mut stream = agent.stream_async(prompt).await?;
     let mut in_text = false;
+    let mut plan_mode_exited = false;
 
     while let Some(event) = stream.next().await {
         let ev = event?;
@@ -253,9 +290,11 @@ async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<()> {
                 let first_line = preview.lines().next().unwrap_or("");
                 println!("  \x1b[{}m{} {}\x1b[0m", color, "result:", first_line);
 
-                // ExitPlanMode should abort the agent loop (matching Claude Code)
+                // ExitPlanMode should abort the agent loop (matching Claude Code).
+                // Also clear history so plan mode system-reminder doesn't persist.
                 if tool_name == "ExitPlanMode" && status == "success" {
                     agent.cancel();
+                    plan_mode_exited = true;
                 }
             }
             "message_stop" => {
@@ -278,7 +317,32 @@ async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<()> {
         }
     }
 
-    Ok(())
+    // After plan mode exit: show plan, clear history, exit plan mode
+    if plan_mode_exited {
+        use strands_tools::utility::plan_state;
+
+        let plan_file = plan_state::get_plan_file_path(None);
+        let plan_content = std::fs::read_to_string(&plan_file).unwrap_or_default();
+
+        agent.clear_history();
+        agent.reset_cancel();
+
+        // Exit plan mode properly
+        if plan_state::is_in_plan_mode() {
+            let _ = plan_state::exit_plan_mode(None);
+        }
+
+        // Show plan to user
+        if !plan_content.trim().is_empty() {
+            println!("\n{}", "─".repeat(60));
+            println!("{} ({})\n", "Plan".bold(), plan_file.display());
+            println!("{}", plan_content.trim());
+            println!("{}", "─".repeat(60));
+            println!("{}", "Type your message to approve and start, or provide feedback.".dimmed());
+        }
+    }
+
+    Ok(plan_mode_exited)
 }
 
 pub fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {

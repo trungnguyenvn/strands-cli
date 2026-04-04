@@ -611,6 +611,11 @@ impl TuiApp {
                     self.switch_model(model_id, event_tx);
                     return;
                 }
+                DispatchResult::Local(CommandResult::ResumeSession(session_ref)) => {
+                    self.reset_input();
+                    self.resume_session(session_ref, event_tx);
+                    return;
+                }
                 DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
                     self.apply_mode_switch(&mode_name);
                     self.reset_input();
@@ -974,6 +979,8 @@ impl TuiApp {
 
         let new_input = if suggestion.model_id.is_some() {
             format!("/model {} ", suggestion.name)
+        } else if let Some(ref sid) = suggestion.session_id {
+            format!("/resume {} ", sid)
         } else {
             format!("/{} ", suggestion.name)
         };
@@ -995,6 +1002,58 @@ impl TuiApp {
         self.state.suggestions[self.state.selected_suggestion as usize]
             .model_id
             .clone()
+    }
+
+    /// If the selected suggestion is a session, return its session_id for direct resume.
+    pub fn selected_session_id(&self) -> Option<String> {
+        if self.state.selected_suggestion < 0
+            || self.state.selected_suggestion as usize >= self.state.suggestions.len()
+        {
+            return None;
+        }
+        self.state.suggestions[self.state.selected_suggestion as usize]
+            .session_id
+            .clone()
+    }
+
+    /// Resume a session by loading its messages and replacing current conversation.
+    pub fn resume_session(
+        &mut self,
+        session_ref: String,
+        event_tx: UnboundedSender<Event>,
+    ) {
+        self.state.messages.push(ChatMessage::user(format!("/resume {}", session_ref)));
+        let mut msg = ChatMessage::assistant_empty();
+        msg.append_text(&format!("Resuming session {}...", session_ref));
+        self.state.messages.push(msg);
+        self.state.auto_scroll = true;
+        self.state.scroll_offset = 0;
+        self.state.agent_status = AgentStatus::Streaming;
+
+        let agent = self.agent.clone();
+        let event_tx_clone = event_tx.clone();
+        tokio::spawn(async move {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let sessions_dir = crate::session::SessionId::storage_dir(&cwd);
+            match crate::session::resolve_and_load(&sessions_dir, &session_ref).await {
+                Ok((id, msgs)) => {
+                    // Replace agent conversation with loaded messages
+                    agent.clear_history();
+                    for m in &msgs {
+                        agent.add_message(m.clone());
+                    }
+                    let _ = event_tx_clone.send(Event::AgentTextDelta(
+                        format!("\nResumed session {} ({} messages)", id, msgs.len()),
+                    ));
+                    let _ = event_tx_clone.send(Event::AgentDone);
+                }
+                Err(e) => {
+                    let _ = event_tx_clone.send(Event::AgentError(
+                        format!("Failed to resume: {}", e),
+                    ));
+                }
+            }
+        });
     }
 
     /// Run the agent stream, forwarding events to the TUI event channel.
@@ -1054,6 +1113,7 @@ impl TuiApp {
                                     // cancelAndAbort behavior). The plan is on disk for the CLI to show.
                                     if tool_name == "ExitPlanMode" && status == "success" {
                                         agent.cancel();
+                                        let _ = event_tx.send(Event::PlanModeExited);
                                     }
 
                                     Some(Event::AgentToolResult { status, content })
@@ -1155,6 +1215,49 @@ impl TuiApp {
                     msg.set_last_tool_status(new_status);
 
                 }
+            }
+            Event::PlanModeExited => {
+                // Matching Claude Code's clear-context path after ExitPlanMode:
+                // 1. Read the plan from disk
+                // 2. Clear agent conversation history (removes stale plan mode system-reminder)
+                // 3. Display the plan to the user
+                // 4. Exit plan mode and restore previous permission mode
+                // 5. Set pending system-reminder with plan context for next turn
+
+                let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                let plan_content = std::fs::read_to_string(&plan_file).unwrap_or_default();
+
+                // Clear stale plan mode conversation context
+                self.agent.clear_history();
+
+                // Exit plan mode properly (restores previous permission mode)
+                if strands_tools::utility::plan_state::is_in_plan_mode() {
+                    let _ = strands_tools::utility::plan_state::exit_plan_mode(None);
+                }
+                self.state.permission_mode = PermissionMode::Default;
+
+                // Show plan to user
+                if !plan_content.trim().is_empty() {
+                    let mut msg = ChatMessage::assistant_empty();
+                    msg.append_text(&format!(
+                        "**Plan** ({})\n\n{}\n\n---\n*Type your message to approve and start implementation, or provide feedback to update the plan.*",
+                        plan_file.display(),
+                        plan_content.trim()
+                    ));
+                    self.state.messages.push(msg);
+                    self.state.auto_scroll = true;
+                    self.state.scroll_offset = 0;
+                }
+
+                // Prepare system context for next turn: inject plan as implementation instructions
+                self.state.pending_system_reminder = Some(format!(
+                    "<system-reminder>\n\
+                     ## Exited Plan Mode\n\n\
+                     You have exited plan mode. You can now make edits, run tools, and take actions. \
+                     The plan file is located at {} if you need to reference it.\n\
+                     </system-reminder>",
+                    plan_file.display()
+                ));
             }
             Event::AgentDone => {
                 self.state.agent_status = AgentStatus::Idle;
