@@ -1191,6 +1191,12 @@ pub struct SuggestionItem {
 /// When the input is `/model ` (with trailing space), returns model choices as suggestions.
 pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_model: &str) -> Vec<SuggestionItem> {
     let trimmed = input.trim();
+
+    // Empty input: show recent sessions as quick-resume suggestions
+    if trimmed.is_empty() {
+        return generate_session_suggestions("");
+    }
+
     if !trimmed.starts_with('/') {
         return Vec::new();
     }
