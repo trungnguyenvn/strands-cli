@@ -64,6 +64,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                 tool_specs: Vec::new(),
                 mcp_tool_specs: Vec::new(),
                 memory_files: Vec::new(),
+                skills: Vec::new(),
                 messages_json,
             };
             match commands::dispatch(input, &registry, &ctx) {

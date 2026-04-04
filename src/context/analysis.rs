@@ -61,6 +61,14 @@ pub enum SuggestionSeverity {
     Critical,
 }
 
+/// Info about a loaded skill.
+#[derive(Clone, Debug)]
+pub struct SkillDetail {
+    pub name: String,
+    pub source: String,
+    pub tokens: u64,
+}
+
 /// Full context analysis result.
 #[derive(Clone, Debug)]
 pub struct ContextData {
@@ -71,6 +79,7 @@ pub struct ContextData {
     pub model: String,
     pub memory_files: Vec<MemoryFileInfo>,
     pub mcp_tools: Vec<McpToolInfo>,
+    pub skills: Vec<SkillDetail>,
     pub suggestions: Vec<ContextSuggestion>,
     /// Actual token counts from the SDK tracker, if available.
     pub api_token_counts: Option<(u64, u64)>,
@@ -88,6 +97,17 @@ pub struct ToolSpecSummary {
     pub input_schema_json: String,
 }
 
+/// Summary of a skill for token estimation.
+#[derive(Clone, Debug)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    /// The skill body content (SKILL.md).
+    pub content: String,
+    /// Source: "project" or "user".
+    pub source: String,
+}
+
 /// Everything needed to run context analysis.
 pub struct AnalysisInput {
     /// Current model name.
@@ -100,6 +120,8 @@ pub struct AnalysisInput {
     pub mcp_tool_specs: Vec<(String, String, String)>,
     /// Loaded memory files: (path, source_type, content).
     pub memory_files: Vec<(String, String, String)>,
+    /// Loaded skills: (name, description, content, source).
+    pub skills: Vec<SkillSummary>,
     /// Conversation messages as JSON values (from agent.get_messages()).
     pub messages_json: Vec<serde_json::Value>,
     /// Token counts from the SDK tracker: (used, limit).
@@ -159,7 +181,29 @@ pub fn analyze_context_usage(input: &AnalysisInput) -> ContextData {
         });
     }
 
-    // 5. Message tokens
+    // 5. Skill tokens
+    let mut skills = Vec::new();
+    let mut skill_tokens: u64 = 0;
+    for skill in &input.skills {
+        // Skills contribute tokens via their frontmatter in the system prompt
+        // (name + description + when_to_use) and their body content when invoked.
+        // We estimate based on the frontmatter portion that's always loaded.
+        let frontmatter = format!(
+            "- {}: {}{}",
+            skill.name,
+            skill.description,
+            skill.content.chars().take(200).collect::<String>(),
+        );
+        let tokens = estimate_tokens(&frontmatter);
+        skill_tokens += tokens;
+        skills.push(SkillDetail {
+            name: skill.name.clone(),
+            source: skill.source.clone(),
+            tokens,
+        });
+    }
+
+    // 6. Message tokens
     let mut message_tokens: u64 = 0;
     for msg in &input.messages_json {
         message_tokens += estimate_tokens_json(msg);
@@ -170,6 +214,7 @@ pub fn analyze_context_usage(input: &AnalysisInput) -> ContextData {
         + builtin_tool_tokens
         + mcp_tool_tokens
         + memory_tokens
+        + skill_tokens
         + message_tokens;
 
     // Prefer SDK-reported total over our estimate
@@ -221,6 +266,13 @@ pub fn analyze_context_usage(input: &AnalysisInput) -> ContextData {
             memory_tokens,
         );
     }
+    if !input.skills.is_empty() {
+        add_category(
+            &mut categories,
+            &format!("Skills ({})", input.skills.len()),
+            skill_tokens,
+        );
+    }
     if !input.messages_json.is_empty() {
         add_category(
             &mut categories,
@@ -244,6 +296,7 @@ pub fn analyze_context_usage(input: &AnalysisInput) -> ContextData {
         model: input.model_name.clone(),
         memory_files,
         mcp_tools,
+        skills,
         suggestions,
         api_token_counts: input.sdk_token_counts,
     }
@@ -398,6 +451,18 @@ pub fn format_context_table(data: &ContextData) -> String {
         lines.push(String::new());
     }
 
+    // Skills detail
+    if !data.skills.is_empty() {
+        lines.push(" Skills:".to_string());
+        for skill in &data.skills {
+            lines.push(format!(
+                "   /{} ({})  {}{} tokens",
+                skill.name, skill.source, approx, format_number(skill.tokens)
+            ));
+        }
+        lines.push(String::new());
+    }
+
     // Suggestions
     if !data.suggestions.is_empty() {
         lines.push(" Suggestions:".to_string());
@@ -481,6 +546,7 @@ mod tests {
             tool_specs: vec![],
             mcp_tool_specs: vec![],
             memory_files: vec![],
+            skills: vec![],
             messages_json: vec![],
             sdk_token_counts: Some((0, 200_000)),
             sdk_context_percent: Some(0.0),
@@ -503,6 +569,7 @@ mod tests {
             }],
             mcp_tool_specs: vec![],
             memory_files: vec![],
+            skills: vec![],
             messages_json: vec![serde_json::json!({"role": "user", "content": "hello world"})],
             sdk_token_counts: None,
             sdk_context_percent: None,
@@ -533,6 +600,7 @@ mod tests {
             model: "test-model".into(),
             memory_files: vec![],
             mcp_tools: vec![],
+            skills: vec![],
             suggestions: vec![ContextSuggestion {
                 message: "Context usage is healthy.".into(),
                 severity: SuggestionSeverity::Info,

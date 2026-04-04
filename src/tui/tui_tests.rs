@@ -417,6 +417,7 @@ fn slash_help_renders_command_list() {
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/help", &state.command_registry, &ctx) {
@@ -474,6 +475,7 @@ fn slash_status_renders_session_info() {
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/status", &state.command_registry, &ctx) {
@@ -524,6 +526,7 @@ fn slash_clear_empties_messages() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/clear", &state.command_registry, &ctx) {
@@ -562,6 +565,7 @@ fn slash_exit_sets_quit_flag() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
 
@@ -595,6 +599,7 @@ fn slash_new_alias_triggers_clear() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
 
@@ -627,6 +632,7 @@ fn slash_question_mark_alias_triggers_help() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
 
@@ -660,6 +666,7 @@ fn slash_compact_returns_prompt() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
 
@@ -689,6 +696,7 @@ fn slash_compact_with_args_includes_custom_instructions() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
 
@@ -723,6 +731,7 @@ fn unknown_command_renders_error() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/nonexistent", &state.command_registry, &ctx) {
@@ -770,6 +779,7 @@ fn file_path_is_not_a_command() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
 
@@ -1022,6 +1032,7 @@ fn try_immediate_command_status_during_streaming() {
     tool_specs: Vec::new(),
     mcp_tool_specs: Vec::new(),
     memory_files: Vec::new(),
+    skills: Vec::new(),
     messages_json: Vec::new(),
     };
     match crate::commands::dispatch(trimmed, &state.command_registry, &ctx) {
@@ -1091,6 +1102,7 @@ fn disabled_command_treated_as_unknown() {
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
 
@@ -1139,6 +1151,7 @@ fn dispatch_model(state: &AppState, args: &str) -> crate::commands::DispatchResu
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
     crate::commands::dispatch(&input, &state.command_registry, &ctx)
@@ -1159,6 +1172,7 @@ fn dispatch_model_and_render(state: &mut AppState, args: &str, w: u16, h: u16) -
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
     match crate::commands::dispatch(&input, &state.command_registry, &ctx) {
@@ -2274,6 +2288,7 @@ fn dispatch_local_text(state: &mut AppState, cmd: &str) {
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
     match crate::commands::dispatch(cmd, &state.command_registry, &ctx) {
@@ -2302,6 +2317,7 @@ fn dispatch_unknown(state: &mut AppState, cmd: &str) {
         tool_specs: Vec::new(),
         mcp_tool_specs: Vec::new(),
         memory_files: Vec::new(),
+        skills: Vec::new(),
         messages_json: Vec::new(),
     };
     match crate::commands::dispatch(cmd, &state.command_registry, &ctx) {

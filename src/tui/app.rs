@@ -355,6 +355,13 @@ pub struct AppState {
     pub tool_spec_summaries: Vec<crate::context::ToolSpecSummary>,
     /// Memory files: (path, source_type, content) for /context.
     pub memory_files: Vec<(String, String, String)>,
+    /// Loaded skills for /context.
+    pub skill_summaries: Vec<crate::context::SkillSummary>,
+
+    // --- Session persistence ---
+
+    /// Current session ID (displayed in status bar, used for /session commands).
+    pub session_id: Option<String>,
 }
 
 /// Permission modes matching Claude Code's Shift+Tab cycle.
@@ -467,6 +474,8 @@ impl AppState {
             system_prompt_text: String::new(),
             tool_spec_summaries: Vec::new(),
             memory_files: Vec::new(),
+            skill_summaries: Vec::new(),
+            session_id: None,
         }
     }
 
@@ -561,6 +570,7 @@ impl TuiApp {
                 tool_specs: self.state.tool_spec_summaries.clone(),
                 mcp_tool_specs,
                 memory_files: self.state.memory_files.clone(),
+                skills: self.state.skill_summaries.clone(),
                 messages_json,
             };
             match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {
@@ -671,6 +681,15 @@ impl TuiApp {
         self.state.history_stash.clear();
         self.state.turn_count += 1;
 
+        // Record last prompt in session journal (fire-and-forget)
+        if let Some(journal) = crate::session::get_journal() {
+            let journal = std::sync::Arc::clone(journal);
+            let prompt_text = prompt.clone();
+            tokio::spawn(async move {
+                let _ = journal.set_last_prompt(prompt_text).await;
+            });
+        }
+
         // Add user message (shown in UI as-is)
         self.state.messages.push(ChatMessage::user(prompt.clone()));
         self.state.messages.push(ChatMessage::assistant_empty());
@@ -759,6 +778,7 @@ impl TuiApp {
             tool_specs: self.state.tool_spec_summaries.clone(),
             mcp_tool_specs,
             memory_files: self.state.memory_files.clone(),
+            skills: self.state.skill_summaries.clone(),
             messages_json,
         };
 

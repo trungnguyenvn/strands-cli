@@ -120,6 +120,8 @@ pub struct CommandContext {
     pub mcp_tool_specs: Vec<(String, String, String)>,
     /// Memory files: (path, source_type, content). For /context command.
     pub memory_files: Vec<(String, String, String)>,
+    /// Loaded skills. For /context command.
+    pub skills: Vec<crate::context::SkillSummary>,
     /// Conversation messages as JSON. For /context command.
     pub messages_json: Vec<serde_json::Value>,
 }
@@ -140,6 +142,7 @@ impl CommandContext {
             tool_specs: Vec::new(),
             mcp_tool_specs: Vec::new(),
             memory_files: Vec::new(),
+            skills: Vec::new(),
             messages_json: Vec::new(),
         }
     }
@@ -479,6 +482,19 @@ fn builtin_commands() -> Vec<Command> {
                 get_prompt: Box::new(cmd_compact_prompt),
             },
         },
+        // /session
+        Command {
+            name: "session".into(),
+            description: "Session management: list, id, title, tag, export".into(),
+            aliases: vec![],
+            is_hidden: false,
+            argument_hint: Some("<subcommand> [args]".into()),
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: cmd_session,
+            },
+        },
     ]
 }
 
@@ -568,6 +584,84 @@ fn format_command_line(cmd: &CommandInfo) -> String {
     format!("  /{}{}{} — {}", cmd.name, hint, aliases, cmd.description)
 }
 
+fn cmd_session(args: &str, _ctx: &CommandContext) -> CommandResult {
+    let parts: Vec<&str> = args.trim().splitn(2, char::is_whitespace).collect();
+    let subcmd = parts.first().copied().unwrap_or("id");
+    let sub_args = parts.get(1).copied().unwrap_or("");
+
+    match subcmd {
+        "id" | "" => {
+            if let Some(journal) = crate::session::get_journal() {
+                CommandResult::Text(format!("Session ID: {}", journal.session_id()))
+            } else {
+                CommandResult::Text("No active session".to_string())
+            }
+        }
+        "list" => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let dir = crate::session::SessionId::storage_dir(&cwd);
+            let sessions = crate::session::list_sessions(&dir);
+            if sessions.is_empty() {
+                CommandResult::Text("No sessions found.".to_string())
+            } else {
+                let mut lines = vec![format!("{:<3}  {:<38}  {:>8}  {}", "#", "Session ID", "Size", "Modified")];
+                for (i, s) in sessions.iter().take(20).enumerate() {
+                    lines.push(format!(
+                        "{:<3}  {:<38}  {:>6}KB  {}",
+                        i + 1,
+                        s.session_id,
+                        s.size_bytes / 1024,
+                        s.modified.format("%Y-%m-%d %H:%M"),
+                    ));
+                }
+                CommandResult::Text(lines.join("\n"))
+            }
+        }
+        "title" => {
+            let title = sub_args.trim();
+            if title.is_empty() {
+                return CommandResult::Text("Usage: /session title <text>".to_string());
+            }
+            if let Some(journal) = crate::session::get_journal() {
+                let journal = std::sync::Arc::clone(journal);
+                let title = title.to_string();
+                tokio::spawn(async move { let _ = journal.set_custom_title(title).await; });
+                CommandResult::Text("Session title updated.".to_string())
+            } else {
+                CommandResult::Text("No active session".to_string())
+            }
+        }
+        "tag" => {
+            let tag = sub_args.trim();
+            if tag.is_empty() {
+                return CommandResult::Text("Usage: /session tag <tag>".to_string());
+            }
+            if let Some(journal) = crate::session::get_journal() {
+                let journal = std::sync::Arc::clone(journal);
+                let tag = tag.to_string();
+                tokio::spawn(async move { let _ = journal.set_tag(tag).await; });
+                CommandResult::Text("Session tag updated.".to_string())
+            } else {
+                CommandResult::Text("No active session".to_string())
+            }
+        }
+        "export" => {
+            if let Some(journal) = crate::session::get_journal() {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let dir = crate::session::SessionId::storage_dir(&cwd);
+                let path = dir.join(format!("{}.jsonl", journal.session_id()));
+                CommandResult::Text(format!("Session file: {}", path.display()))
+            } else {
+                CommandResult::Text("No active session".to_string())
+            }
+        }
+        other => CommandResult::Text(format!(
+            "Unknown subcommand: '{}'. Available: list, id, title, tag, export",
+            other,
+        )),
+    }
+}
+
 fn cmd_status(_args: &str, ctx: &CommandContext) -> CommandResult {
     let lines = vec![
         format!("Model: {}", ctx.model_name),
@@ -598,6 +692,7 @@ fn cmd_context(_args: &str, ctx: &CommandContext) -> CommandResult {
             .collect(),
         mcp_tool_specs: ctx.mcp_tool_specs.clone(),
         memory_files: ctx.memory_files.clone(),
+        skills: ctx.skills.clone(),
         messages_json: ctx.messages_json.clone(),
         sdk_token_counts: ctx.token_counts,
         sdk_context_percent: ctx.context_percent_used,

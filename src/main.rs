@@ -31,6 +31,7 @@ mod context;
 mod mcp;
 mod prompt;
 mod repl;
+pub mod session;
 mod tui;
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,14 @@ struct Cli {
     /// Disable fullscreen TUI, use plain-text REPL instead
     #[arg(long = "no-tui")]
     no_tui: bool,
+
+    /// Resume the most recent session (or a specific one with --session)
+    #[arg(long)]
+    resume: bool,
+
+    /// Specific session ID to resume (implies --resume)
+    #[arg(long)]
+    session: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +164,35 @@ async fn main() -> Result<()> {
         })
         .collect();
 
+    // -- Session persistence (JSONL journal) ---------------------------------
+    let sessions_dir = session::SessionId::storage_dir(&cwd);
+
+    // Determine session ID: resume an existing session or create a new one
+    let resume_ref = cli.session.as_deref().or(if cli.resume { Some("latest") } else { None });
+    let (session_id, resumed_messages) = if let Some(session_ref) = resume_ref {
+        match session::resolve_and_load(&sessions_dir, session_ref).await {
+            Ok((id, msgs)) => {
+                eprintln!("Resumed session {} ({} messages)", id, msgs.len());
+                (session::SessionId::from_existing(id), msgs)
+            }
+            Err(e) => {
+                eprintln!("Warning: could not resume session: {e}");
+                (session::SessionId::new(), Vec::new())
+            }
+        }
+    } else {
+        (session::SessionId::new(), Vec::new())
+    };
+
+    let journal_mgr = strands::session::JournalSessionManager::new(
+        session_id.as_str().to_string(),
+        Some(sessions_dir),
+        Some(30), // retention_days
+    )
+    .await
+    .map_err(|e| strands::Error::Session(format!("journal init: {e}")))?;
+    session::set_journal(Arc::clone(&journal_mgr));
+
     // Build agent with proactive context management
     let summarizing = Arc::new(
         strands::agent::conversation_manager::SummarizingConversationManager::new(
@@ -170,10 +208,18 @@ async fn main() -> Result<()> {
         .with_tools(tools)
         .with_max_iterations(cli.max_iterations)
         .with_conversation_manager(summarizing)
-        .with_proactive_context_management(cli.context_window, cli.max_tokens.max(0) as u64);
+        .with_proactive_context_management(cli.context_window, cli.max_tokens.max(0) as u64)
+        .with_session_manager(journal_mgr as Arc<dyn strands::session::SessionManager>)
+        .with_agent_id(session_id.as_str().to_string());
 
-    // Inject STRANDS.md as initial conversation context
-    if let Some(ref user_ctx) = user_ctx {
+    // Inject initial conversation state (resumed messages or STRANDS.md context)
+    if !resumed_messages.is_empty() {
+        let mut state = AgentState::new();
+        for msg in resumed_messages {
+            state.add_message(msg);
+        }
+        builder = builder.with_conversation_state(state);
+    } else if let Some(ref user_ctx) = user_ctx {
         let mut state = AgentState::new();
         state.add_message(Message::user(format!(
             "<context>\n{}\n</context>",
@@ -215,12 +261,27 @@ async fn main() -> Result<()> {
         } else {
             Vec::new()
         };
+        let skill_data: Vec<context::SkillSummary> = skill_cmd_infos
+            .iter()
+            .map(|s| context::SkillSummary {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                content: s.body.clone(),
+                source: "project".to_string(),
+            })
+            .collect();
         let ctx_setup = tui::ContextSetup {
             system_prompt: system_prompt_for_ctx,
             tool_specs: tool_specs_for_ctx,
             memory_files: memory_file_data,
+            skills: skill_data,
         };
-        tui::run(agent, model_name, command_registry, cwd, ctx_setup).await?;
+        tui::run(agent, model_name, command_registry, cwd, ctx_setup, Some(session_id.as_str().to_string())).await?;
+    }
+
+    // Flush session journal before exit
+    if let Some(journal) = session::get_journal() {
+        let _ = journal.flush().await;
     }
 
     Ok(())

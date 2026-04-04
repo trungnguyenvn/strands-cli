@@ -100,7 +100,18 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         Span::raw("")
     };
 
-    // Build spans: hint | mode? | model | mcp? | turns? | scroll?
+    // Session ID (abbreviated to last 8 chars, like Claude Code's display)
+    let session_span = if let Some(ref id) = state.session_id {
+        let abbrev = if id.len() > 8 { &id[id.len() - 8..] } else { id };
+        Span::styled(
+            format!("#{}", abbrev),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::raw("")
+    };
+
+    // Build spans: hint | mode? | model | session? | mcp? | turns? | scroll?
     let mut spans = vec![hint];
 
     if state.permission_mode != PermissionMode::Default {
@@ -110,6 +121,11 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
 
     spans.push(sep.clone());
     spans.push(model);
+
+    if state.session_id.is_some() {
+        spans.push(sep.clone());
+        spans.push(session_span);
+    }
 
     if !matches!(state.mcp_status, McpStatus::None) {
         spans.push(sep.clone());
