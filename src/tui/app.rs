@@ -346,6 +346,15 @@ pub struct AppState {
     /// Pending system-reminder to inject into the next user prompt.
     /// Set when entering plan mode; consumed (taken) on the next agent call.
     pub pending_system_reminder: Option<String>,
+
+    // --- Context analysis data (set once at startup for /context command) ---
+
+    /// System prompt text (for token estimation in /context).
+    pub system_prompt_text: String,
+    /// Tool spec summaries (for token estimation in /context).
+    pub tool_spec_summaries: Vec<crate::context::ToolSpecSummary>,
+    /// Memory files: (path, source_type, content) for /context.
+    pub memory_files: Vec<(String, String, String)>,
 }
 
 /// Permission modes matching Claude Code's Shift+Tab cycle.
@@ -455,6 +464,9 @@ impl AppState {
             token_counts: None,
             pending_compact: false,
             pending_system_reminder: None,
+            system_prompt_text: String::new(),
+            tool_spec_summaries: Vec::new(),
+            memory_files: Vec::new(),
         }
     }
 
@@ -517,12 +529,39 @@ impl TuiApp {
         // Handle slash commands via registry dispatch
         let trimmed = prompt.trim();
         if trimmed.starts_with('/') {
+            // Build messages JSON from agent for /context analysis
+            let messages_json: Vec<serde_json::Value> = self
+                .agent
+                .get_messages()
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect();
+
+            // Build MCP tool specs from server info
+            let mcp_tool_specs: Vec<(String, String, String)> = self
+                .state
+                .mcp_servers
+                .iter()
+                .flat_map(|s| {
+                    s.tool_names.iter().map(move |t| {
+                        (t.clone(), s.name.clone(), format!("{{\"name\":\"{}\"}}", t))
+                    })
+                })
+                .collect();
+
             let ctx = CommandContext {
                 model_name: self.state.model_name.clone(),
                 turn_count: self.state.turn_count,
                 message_count: self.state.messages.len(),
                 all_commands: self.state.command_registry.command_infos(),
                 mcp_servers: self.state.mcp_servers.clone(),
+                token_counts: self.state.token_counts,
+                context_percent_used: self.state.context_percent_used,
+                system_prompt: self.state.system_prompt_text.clone(),
+                tool_specs: self.state.tool_spec_summaries.clone(),
+                mcp_tool_specs,
+                memory_files: self.state.memory_files.clone(),
+                messages_json,
             };
             match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {
                 DispatchResult::Local(CommandResult::Quit) => {
@@ -692,12 +731,35 @@ impl TuiApp {
             return;
         }
 
+        let messages_json: Vec<serde_json::Value> = self
+            .agent
+            .get_messages()
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let mcp_tool_specs: Vec<(String, String, String)> = self
+            .state
+            .mcp_servers
+            .iter()
+            .flat_map(|s| {
+                s.tool_names.iter().map(move |t| {
+                    (t.clone(), s.name.clone(), format!("{{\"name\":\"{}\"}}", t))
+                })
+            })
+            .collect();
         let ctx = CommandContext {
             model_name: self.state.model_name.clone(),
             turn_count: self.state.turn_count,
             message_count: self.state.messages.len(),
             all_commands: self.state.command_registry.command_infos(),
             mcp_servers: self.state.mcp_servers.clone(),
+            token_counts: self.state.token_counts,
+            context_percent_used: self.state.context_percent_used,
+            system_prompt: self.state.system_prompt_text.clone(),
+            tool_specs: self.state.tool_spec_summaries.clone(),
+            mcp_tool_specs,
+            memory_files: self.state.memory_files.clone(),
+            messages_json,
         };
 
         match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {

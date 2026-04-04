@@ -22,7 +22,14 @@ use self::terminal::Tui;
 use self::widgets::input_bar::{self, InputAction};
 
 /// Run the fullscreen TUI.
-pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry, cwd: PathBuf) -> strands::Result<()> {
+/// Extra context data for the /context command, passed from main.
+pub struct ContextSetup {
+    pub system_prompt: String,
+    pub tool_specs: Vec<crate::context::ToolSpecSummary>,
+    pub memory_files: Vec<(String, String, String)>,
+}
+
+pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry, cwd: PathBuf, context_setup: ContextSetup) -> strands::Result<()> {
     // Install panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -40,6 +47,9 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
     tui.enter_with_fullscreen(fullscreen).map_err(|e| strands::Error::Configuration(e.to_string()))?;
 
     let mut app = TuiApp::new(agent, model_name, command_registry);
+    app.state.system_prompt_text = context_setup.system_prompt;
+    app.state.tool_spec_summaries = context_setup.tool_specs;
+    app.state.memory_files = context_setup.memory_files;
     let mut event_rx = tui.event_rx.take().unwrap();
     let event_tx = tui.event_tx.clone();
 

@@ -108,6 +108,20 @@ pub struct CommandContext {
     pub all_commands: Vec<CommandInfo>,
     /// Connected MCP servers (for /mcp command).
     pub mcp_servers: Vec<crate::mcp::McpServerInfo>,
+    /// Token counts from the SDK tracker: (used, limit). For /context command.
+    pub token_counts: Option<(u64, u64)>,
+    /// Context percent used from the SDK tracker. For /context command.
+    pub context_percent_used: Option<f64>,
+    /// System prompt text for token estimation. For /context command.
+    pub system_prompt: String,
+    /// Tool spec summaries for token estimation. For /context command.
+    pub tool_specs: Vec<crate::context::ToolSpecSummary>,
+    /// MCP tool specs: (name, server, spec_json). For /context command.
+    pub mcp_tool_specs: Vec<(String, String, String)>,
+    /// Memory files: (path, source_type, content). For /context command.
+    pub memory_files: Vec<(String, String, String)>,
+    /// Conversation messages as JSON. For /context command.
+    pub messages_json: Vec<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -120,6 +134,13 @@ impl CommandContext {
             message_count,
             all_commands: Vec::new(),
             mcp_servers: Vec::new(),
+            token_counts: None,
+            context_percent_used: None,
+            system_prompt: String::new(),
+            tool_specs: Vec::new(),
+            mcp_tool_specs: Vec::new(),
+            memory_files: Vec::new(),
+            messages_json: Vec::new(),
         }
     }
 }
@@ -225,7 +246,7 @@ impl CommandRegistry {
 /// Names of built-in commands (used to distinguish from skills in /help).
 fn builtin_command_names() -> &'static [&'static str] {
     &["exit", "clear", "help", "status", "compact", "model", "skills", "mcp",
-      "plan", "default", "accept-edits", "bypass"]
+      "plan", "default", "accept-edits", "bypass", "context"]
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +453,19 @@ fn builtin_commands() -> Vec<Command> {
                 execute: |_, _| CommandResult::ModeSwitch("bypass".into()),
             },
         },
+        // /context
+        Command {
+            name: "context".into(),
+            description: "Show context window usage breakdown".into(),
+            aliases: vec!["ctx".into()],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: cmd_context,
+            },
+        },
         // /compact
         Command {
             name: "compact".into(),
@@ -547,6 +581,29 @@ fn cmd_status(_args: &str, ctx: &CommandContext) -> CommandResult {
         ),
     ];
     CommandResult::Text(lines.join("\n"))
+}
+
+fn cmd_context(_args: &str, ctx: &CommandContext) -> CommandResult {
+    let input = crate::context::AnalysisInput {
+        model_name: ctx.model_name.clone(),
+        system_prompt: ctx.system_prompt.clone(),
+        tool_specs: ctx
+            .tool_specs
+            .iter()
+            .map(|s| crate::context::ToolSpecSummary {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                input_schema_json: s.input_schema_json.clone(),
+            })
+            .collect(),
+        mcp_tool_specs: ctx.mcp_tool_specs.clone(),
+        memory_files: ctx.memory_files.clone(),
+        messages_json: ctx.messages_json.clone(),
+        sdk_token_counts: ctx.token_counts,
+        sdk_context_percent: ctx.context_percent_used,
+    };
+    let data = crate::context::analyze_context_usage(&input);
+    CommandResult::Text(crate::context::format_context_table(&data))
 }
 
 // ---------------------------------------------------------------------------

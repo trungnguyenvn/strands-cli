@@ -411,6 +411,13 @@ fn slash_help_renders_command_list() {
         message_count: state.messages.len(),
         all_commands: state.command_registry.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/help", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -461,6 +468,13 @@ fn slash_status_renders_session_info() {
         message_count: 0,
         all_commands: state.command_registry.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/status", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -504,6 +518,13 @@ fn slash_clear_empties_messages() {
         message_count: 2,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/clear", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Clear) => {
@@ -535,6 +556,13 @@ fn slash_exit_sets_quit_flag() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/exit", &state.command_registry, &ctx) {
@@ -561,6 +589,13 @@ fn slash_new_alias_triggers_clear() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/new", &state.command_registry, &ctx) {
@@ -586,6 +621,13 @@ fn slash_question_mark_alias_triggers_help() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/?", &state.command_registry, &ctx) {
@@ -612,6 +654,13 @@ fn slash_compact_returns_prompt() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/compact", &state.command_registry, &ctx) {
@@ -634,6 +683,13 @@ fn slash_compact_with_args_includes_custom_instructions() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/compact keep all file paths", &state.command_registry, &ctx) {
@@ -661,6 +717,13 @@ fn unknown_command_renders_error() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
     match crate::commands::dispatch("/nonexistent", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Unknown(name) => {
@@ -701,6 +764,13 @@ fn file_path_is_not_a_command() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/var/log/foo", &state.command_registry, &ctx) {
@@ -946,6 +1016,13 @@ fn try_immediate_command_status_during_streaming() {
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
     mcp_servers: Vec::new(),
+    token_counts: None,
+    context_percent_used: None,
+    system_prompt: String::new(),
+    tool_specs: Vec::new(),
+    mcp_tool_specs: Vec::new(),
+    memory_files: Vec::new(),
+    messages_json: Vec::new(),
     };
     match crate::commands::dispatch(trimmed, &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -1008,6 +1085,13 @@ fn disabled_command_treated_as_unknown() {
         message_count: 0,
         all_commands: reg.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
 
     match crate::commands::dispatch("/secret", &reg, &ctx) {
@@ -1049,6 +1133,13 @@ fn dispatch_model(state: &AppState, args: &str) -> crate::commands::DispatchResu
         message_count: state.messages.len(),
         all_commands: state.command_registry.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
     crate::commands::dispatch(&input, &state.command_registry, &ctx)
 }
@@ -1062,6 +1153,13 @@ fn dispatch_model_and_render(state: &mut AppState, args: &str, w: u16, h: u16) -
         message_count: state.messages.len(),
         all_commands: state.command_registry.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
     match crate::commands::dispatch(&input, &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
@@ -2170,6 +2268,13 @@ fn dispatch_local_text(state: &mut AppState, cmd: &str) {
         message_count: state.messages.len(),
         all_commands: state.command_registry.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
     match crate::commands::dispatch(cmd, &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -2191,6 +2296,13 @@ fn dispatch_unknown(state: &mut AppState, cmd: &str) {
         message_count: state.messages.len(),
         all_commands: state.command_registry.command_infos(),
         mcp_servers: Vec::new(),
+        token_counts: None,
+        context_percent_used: None,
+        system_prompt: String::new(),
+        tool_specs: Vec::new(),
+        mcp_tool_specs: Vec::new(),
+        memory_files: Vec::new(),
+        messages_json: Vec::new(),
     };
     match crate::commands::dispatch(cmd, &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Unknown(name) => {

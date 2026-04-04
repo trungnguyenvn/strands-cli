@@ -24,7 +24,7 @@ use strands_tools::utility::skill::{
     SkillCallback, SkillExecutionResult, SkillTool, get_skill,
 };
 use strands_tools::utility::skill_loader::{load_skills_dir, register_loaded_skill};
-use strands_tools::{FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool};
+use strands_tools::{EnterPlanModeTool, ExitPlanModeTool, FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool};
 
 mod commands;
 mod context;
@@ -140,6 +140,20 @@ async fn main() -> Result<()> {
         None => prompt::PromptSource::Default,
     };
     let system_prompt = prompt::build_effective_system_prompt(source, &render_ctx);
+    let system_prompt_for_ctx = system_prompt.clone();
+
+    // Pre-extract tool specs for /context command (before tools are moved into agent)
+    let tool_specs_for_ctx: Vec<context::ToolSpecSummary> = tools
+        .iter()
+        .map(|t| {
+            let spec = t.tool_spec();
+            context::ToolSpecSummary {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                input_schema_json: serde_json::to_string(&spec.input_schema).unwrap_or_default(),
+            }
+        })
+        .collect();
 
     // Build agent with proactive context management
     let summarizing = Arc::new(
@@ -179,7 +193,34 @@ async fn main() -> Result<()> {
     } else if cli.no_tui {
         repl::run_repl(&agent, command_registry, mcp_servers_for_repl).await?;
     } else {
-        tui::run(agent, model_name, command_registry, cwd).await?;
+        // Build context setup for /context command
+        let home_strands = std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".strands"));
+        let memory_file_data: Vec<(String, String, String)> = if let Some(ref uc) = user_ctx {
+            uc.sources
+                .iter()
+                .filter_map(|p| {
+                    let content = std::fs::read_to_string(p).ok()?;
+                    let source_type = if home_strands
+                        .as_ref()
+                        .map_or(false, |hs| p.starts_with(hs))
+                    {
+                        "global"
+                    } else {
+                        "project"
+                    };
+                    Some((p.display().to_string(), source_type.to_string(), content))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ctx_setup = tui::ContextSetup {
+            system_prompt: system_prompt_for_ctx,
+            tool_specs: tool_specs_for_ctx,
+            memory_files: memory_file_data,
+        };
+        tui::run(agent, model_name, command_registry, cwd, ctx_setup).await?;
     }
 
     Ok(())
@@ -452,6 +493,10 @@ fn build_tools() -> Vec<Arc<dyn AgentTool>> {
 
     // Think tool (structured reasoning)
     tools.push(Arc::new(ThinkTool::new()));
+
+    // Plan mode tools
+    tools.push(Arc::new(EnterPlanModeTool::new()));
+    tools.push(Arc::new(ExitPlanModeTool::new()));
 
     tools
 }

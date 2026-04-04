@@ -47,12 +47,24 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
 
         // Dispatch slash commands via registry
         if input.starts_with('/') {
+            let messages_json: Vec<serde_json::Value> = agent
+                .get_messages()
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect();
             let ctx = CommandContext {
                 model_name: String::new(), // not available in plain REPL
                 turn_count,
                 message_count,
                 all_commands: registry.command_infos(),
                 mcp_servers: mcp_servers.clone(),
+                token_counts: agent.token_counts(),
+                context_percent_used: agent.context_percent_used(),
+                system_prompt: String::new(),
+                tool_specs: Vec::new(),
+                mcp_tool_specs: Vec::new(),
+                memory_files: Vec::new(),
+                messages_json,
             };
             match commands::dispatch(input, &registry, &ctx) {
                 DispatchResult::Local(CommandResult::Quit) => break,
