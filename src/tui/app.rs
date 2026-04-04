@@ -1035,6 +1035,7 @@ impl TuiApp {
                                     Some(Event::AgentToolCall { name, input })
                                 }
                                 "tool_result" => {
+                                    let tool_name = ev.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
                                     let status = if let Some(s) = ev.get("status").and_then(|v| v.as_str()) {
                                         s.to_string()
                                     } else if ev.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -1048,6 +1049,13 @@ impl TuiApp {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
+
+                                    // ExitPlanMode should abort the agent loop (matching Claude Code's
+                                    // cancelAndAbort behavior). The plan is on disk for the CLI to show.
+                                    if tool_name == "ExitPlanMode" && status == "success" {
+                                        agent.cancel();
+                                    }
+
                                     Some(Event::AgentToolResult { status, content })
                                 }
                                 "message_stop" | "stream_complete" => {

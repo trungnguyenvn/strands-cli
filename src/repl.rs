@@ -241,6 +241,7 @@ async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<()> {
                 println!(" {}", summary.dimmed());
             }
             "tool_result" => {
+                let tool_name = ev.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
                 let status = ev.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let content = ev.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let preview = if content.len() > 200 {
@@ -251,6 +252,11 @@ async fn stream_turn(agent: &Agent, prompt: &str) -> strands::Result<()> {
                 let color = if status == "success" { "32" } else { "31" };
                 let first_line = preview.lines().next().unwrap_or("");
                 println!("  \x1b[{}m{} {}\x1b[0m", color, "result:", first_line);
+
+                // ExitPlanMode should abort the agent loop (matching Claude Code)
+                if tool_name == "ExitPlanMode" && status == "success" {
+                    agent.cancel();
+                }
             }
             "message_stop" => {
                 if in_text {
