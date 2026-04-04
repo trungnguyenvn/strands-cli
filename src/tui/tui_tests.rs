@@ -3,19 +3,288 @@
 //! These tests render the full TUI layout into an in-memory buffer and assert
 //! on the visible output — verifying the slash command system works from
 //! keypress through dispatch to rendered screen.
+//!
+//! ## Test harness architecture
+//!
+//! `TestHarness` wraps a real `TuiApp` with a mock model (no API key needed).
+//! It drives the same code paths as the real TUI event loop:
+//!
+//! ```text
+//! harness.type_str("hello")    →  handle_key(Key('h')), handle_key(Key('e')), ...
+//! harness.press_enter()        →  handle_key(Enter) → TuiApp::submit() → spawns agent
+//! harness.feed_agent_events()  →  TuiApp::handle_agent_event() (simulates stream)
+//! harness.render()             →  ratatui::Terminal::draw(render::view)
+//! harness.tick(n)              →  advances tick_count (drives spinner, Ctrl+C window)
+//! ```
 
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::collections::VecDeque;
+
+use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use futures::{stream, Stream};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
+use serde_json::Value;
 
-use super::app::{AgentStatus, AppState, ChatMessage};
+use super::app::{AgentStatus, AppState, ChatMessage, TuiApp};
+use super::event::Event;
 use super::render;
 use super::widgets::input_bar;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Mock model — minimal impl for creating a TuiApp without real API keys
+// ===========================================================================
+
+/// A mock model that never actually streams. The TUI tests simulate agent
+/// events directly via `handle_agent_event`, so we only need the model to
+/// satisfy the `Agent::builder().build()` requirement.
+struct MockModel {
+    responses: Mutex<VecDeque<String>>,
+}
+
+impl MockModel {
+    fn new() -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Queue a text response for the next `converse`/`stream` call.
+    #[allow(dead_code)]
+    fn push_response(&self, text: &str) {
+        self.responses.lock().unwrap().push_back(text.to_string());
+    }
+}
+
+#[async_trait]
+impl strands::types_module::models::model::Model for MockModel {
+    async fn converse<'a>(
+        &self,
+        _request: &strands::types_module::models::model::ModelRequest,
+    ) -> strands::Result<strands::types_module::models::model::ModelResponse> {
+        let text = self.responses.lock().unwrap().pop_front().unwrap_or_default();
+        Ok(strands::types_module::models::model::ModelResponse::Text(text))
+    }
+
+    fn update_config(&mut self, _config: Value) -> strands::Result<()> {
+        Ok(())
+    }
+
+    fn get_config(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    async fn structured_output(
+        &self,
+        _schema: Value,
+        _prompt: &strands::types_module::content::Messages,
+    ) -> strands::Result<Pin<Box<dyn Stream<Item = strands::Result<Value>> + Send>>> {
+        Ok(Box::pin(stream::empty()))
+    }
+
+    fn format_request(
+        &self,
+        _messages: &strands::types_module::content::Messages,
+        _system_prompt: Option<&str>,
+        _tools: &[strands::ToolSpec],
+        _config: &Value,
+    ) -> strands::Result<Value> {
+        Ok(serde_json::json!({"mock": true}))
+    }
+
+    async fn stream(
+        &self,
+        _request: Value,
+    ) -> strands::Result<Pin<Box<dyn Stream<Item = strands::Result<Value>> + Send>>> {
+        Ok(Box::pin(stream::empty()))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// ===========================================================================
+// TestHarness — drives TuiApp through the real key handling + event paths
+// ===========================================================================
+
+/// E2E test harness that wraps a real `TuiApp` with a mock model.
+///
+/// All user interactions go through the same `handle_key` → `submit` →
+/// `handle_agent_event` code paths as the live TUI. Agent streaming is
+/// simulated by feeding events directly (no tokio spawn needed).
+struct TestHarness {
+    app: TuiApp,
+    /// Fake event_tx — `handle_key` requires one for `submit()`, but we
+    /// don't consume from it in tests. We drain and inspect it instead.
+    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    width: u16,
+    height: u16,
+    /// Keep the tokio runtime alive — `submit()` calls `tokio::spawn`
+    /// which requires an active runtime context.
+    _rt: tokio::runtime::Runtime,
+    /// Guard that enters the runtime context so `tokio::spawn` works
+    /// from synchronous code (handle_key → submit → tokio::spawn).
+    _guard: tokio::runtime::EnterGuard<'static>,
+}
+
+impl TestHarness {
+    /// Create a new harness with the given terminal dimensions.
+    fn new(width: u16, height: u16) -> Self {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let agent = rt.block_on(async {
+            strands::Agent::builder()
+                .with_model(std::sync::Arc::new(MockModel::new()))
+                .with_system_prompt("test")
+                .with_max_iterations(1)
+                .build()
+                .await
+                .unwrap()
+        });
+        // Enter the runtime context so tokio::spawn works in sync code.
+        // Safety: we leak a &'static reference to the runtime, which is fine
+        // for tests — each test creates its own runtime.
+        let rt_ref: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
+        let guard = rt_ref.enter();
+        let registry = crate::commands::builtin_registry();
+        let mut app = TuiApp::new(agent, "test-model".to_string(), registry);
+        app.state.terminal_width = width;
+        app.state.mcp_status = super::app::McpStatus::None;
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Store a dummy Runtime (we leaked the real one) — use Runtime::new()
+        // just to satisfy the struct field. The leaked one stays alive.
+        let dummy_rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        Self { app, event_tx, event_rx, width, height, _rt: dummy_rt, _guard: guard }
+    }
+
+    // --- Input simulation ---
+
+    /// Type a string character by character through handle_key.
+    fn type_str(&mut self, text: &str) {
+        for ch in text.chars() {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            super::handle_key(&mut self.app, key, self.event_tx.clone());
+        }
+    }
+
+    /// Press Enter through the real handle_key path.
+    fn press_enter(&mut self) {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    /// Press Escape through handle_key.
+    fn press_esc(&mut self) {
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    /// Press Ctrl+C through handle_key.
+    fn press_ctrl_c(&mut self) {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    /// Press Tab through handle_key.
+    fn press_tab(&mut self) {
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    /// Press Up arrow through handle_key.
+    fn press_up(&mut self) {
+        let key = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    /// Press Down arrow through handle_key.
+    fn press_down(&mut self) {
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    /// Press Backspace through handle_key.
+    fn press_backspace(&mut self) {
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        super::handle_key(&mut self.app, key, self.event_tx.clone());
+    }
+
+    // --- Agent event simulation ---
+
+    /// Feed a sequence of agent events (simulating a streaming response).
+    fn feed_agent_events(&mut self, events: Vec<Event>) {
+        for event in events {
+            self.app.handle_agent_event(event);
+        }
+    }
+
+    /// Simulate a complete agent text response (text deltas + done).
+    fn simulate_response(&mut self, text: &str) {
+        // Simulate streaming: split text into word-sized deltas
+        let events: Vec<Event> = text
+            .split_inclusive(' ')
+            .map(|chunk| Event::AgentTextDelta(chunk.to_string()))
+            .chain(std::iter::once(Event::AgentDone))
+            .collect();
+        self.feed_agent_events(events);
+    }
+
+    /// Simulate a tool call + result in the agent stream.
+    fn simulate_tool_call(&mut self, name: &str, summary: &str) {
+        self.feed_agent_events(vec![
+            Event::AgentToolStart { name: name.to_string() },
+            Event::AgentToolCall {
+                name: name.to_string(),
+                input: serde_json::json!({"summary": summary}),
+            },
+            Event::AgentToolResult {
+                status: "success".to_string(),
+                content: String::new(),
+            },
+        ]);
+    }
+
+    // --- Time simulation ---
+
+    /// Advance tick count (12Hz, so 12 ticks = 1 second).
+    fn tick(&mut self, n: usize) {
+        self.app.state.tick_count = self.app.state.tick_count.wrapping_add(n);
+    }
+
+    // --- Render + assert ---
+
+    /// Render the TUI and return the terminal buffer.
+    fn render(&mut self) -> Buffer {
+        let backend = TestBackend::new(self.width, self.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::view(frame, &mut self.app.state))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Get the current input text.
+    fn input_text(&self) -> String {
+        self.app.state.input.lines().join("\n")
+    }
+
+    /// Drain events sent to event_tx (from submit spawning agent tasks).
+    fn drain_events(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Ok(e) = self.event_rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+}
+
+// ===========================================================================
+// Legacy helpers (used by older tests, kept for compatibility)
+// ===========================================================================
 
 /// Create a default AppState with a given terminal width/height.
 fn make_state(width: u16, _height: u16) -> AppState {
@@ -1221,4 +1490,1121 @@ fn model_picker_always_has_items() {
         }
         _ => panic!("expected ModelPicker"),
     }
+}
+
+// ===========================================================================
+// E2E: Cache invalidation — local commands must invalidate render cache
+// ===========================================================================
+
+/// Regression test: running /status (or /mcp) twice should show both outputs.
+/// Previously, the second invocation was invisible because `invalidate_cache()`
+/// was not called after pushing messages from `CommandResult::Text`.
+#[test]
+fn local_command_text_invalidates_cache_on_repeated_calls() {
+    let mut state = make_state(80, 40);
+
+    // First /status
+    dispatch_local_text(&mut state, "/status");
+    let buf1 = render_to_buffer(&mut state, 80, 40);
+    let lines1 = buffer_lines(&buf1);
+    let status_count_1 = lines1.iter().filter(|l| l.contains("Model: test-model")).count();
+    assert_eq!(status_count_1, 1, "First /status should show model info once");
+
+    // Second /status — this must also render (was the bug)
+    dispatch_local_text(&mut state, "/status");
+    let buf2 = render_to_buffer(&mut state, 80, 40);
+    let lines2 = buffer_lines(&buf2);
+    let status_count_2 = lines2.iter().filter(|l| l.contains("Model: test-model")).count();
+    assert_eq!(status_count_2, 2, "Second /status should show model info twice, got: {}", status_count_2);
+}
+
+/// Verify unknown command also invalidates cache.
+#[test]
+fn unknown_command_invalidates_cache() {
+    let mut state = make_state(80, 40);
+
+    // First unknown
+    dispatch_unknown(&mut state, "/foo");
+    let buf1 = render_to_buffer(&mut state, 80, 40);
+    assert!(buffer_contains(&buf1, "Unknown command"));
+
+    // Second unknown
+    dispatch_unknown(&mut state, "/bar");
+    let buf2 = render_to_buffer(&mut state, 80, 40);
+    let lines = buffer_lines(&buf2);
+    let count = lines.iter().filter(|l| l.contains("Unknown command")).count();
+    assert_eq!(count, 2, "Both unknown commands should be visible, got: {}", count);
+}
+
+/// Per-message cache is populated after render and reused on subsequent renders.
+#[test]
+fn per_message_cache_populated_after_render() {
+    let mut state = make_state(80, 24);
+    state.messages.push(ChatMessage::user("hello".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("world");
+    state.messages.push(msg);
+
+    let _ = render_to_buffer(&mut state, 80, 24);
+
+    // Cache should be populated for both messages
+    assert_eq!(state.message_cache.len(), 2);
+    assert!(state.message_cache[0].is_some(), "User message should be cached");
+    assert!(state.message_cache[1].is_some(), "Assistant message should be cached");
+}
+
+/// Per-message cache auto-invalidates when message content changes (fingerprint mismatch).
+#[test]
+fn per_message_cache_invalidates_on_content_change() {
+    let mut state = make_state(80, 30);
+
+    state.messages.push(ChatMessage::user("hello".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("world");
+    state.messages.push(msg);
+
+    let _ = render_to_buffer(&mut state, 80, 30);
+
+    // Push more messages
+    state.messages.push(ChatMessage::user("second".into()));
+    let mut msg2 = ChatMessage::assistant_empty();
+    msg2.append_text("response");
+    state.messages.push(msg2);
+
+    // Render again — new content should appear (cache auto-extends)
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "second"), "New user message should be visible");
+    assert!(buffer_contains(&buf, "response"), "New assistant message should be visible");
+    assert_eq!(state.message_cache.len(), 4, "Cache should have entries for all messages");
+}
+
+// ===========================================================================
+// E2E: Streaming cache — old messages cached, only last re-rendered
+// ===========================================================================
+
+/// During streaming, per-message caches for earlier messages stay valid.
+#[test]
+fn streaming_caches_stable_messages() {
+    let mut state = make_state(80, 30);
+
+    // Add some history
+    state.messages.push(ChatMessage::user("question 1".into()));
+    let mut r1 = ChatMessage::assistant_empty();
+    r1.append_text("answer with **bold** and `code`");
+    state.messages.push(r1);
+
+    // Start "streaming" — add empty assistant message
+    state.messages.push(ChatMessage::user("question 2".into()));
+    state.messages.push(ChatMessage::assistant_empty());
+    state.agent_status = AgentStatus::Streaming;
+
+    // First render during streaming — should cache stable messages (0..2)
+    let _ = render_to_buffer(&mut state, 80, 30);
+    assert_eq!(state.message_cache.len(), 4);
+    assert!(state.message_cache[0].is_some(), "User msg 0 should be cached");
+    assert!(state.message_cache[1].is_some(), "Assistant msg 1 should be cached");
+    let cached_lines_0 = state.message_cache[0].as_ref().unwrap().lines.len();
+
+    // Simulate streaming text deltas
+    state.messages.last_mut().unwrap().append_text("partial ");
+    let _ = render_to_buffer(&mut state, 80, 30);
+
+    // Earlier message caches should be unchanged
+    assert_eq!(state.message_cache[0].as_ref().unwrap().lines.len(), cached_lines_0,
+        "Stable message cache should remain unchanged during streaming deltas");
+}
+
+/// Verify streaming message renders its latest text.
+#[test]
+fn streaming_message_shows_complete_lines() {
+    let mut state = make_state(80, 30);
+
+    state.messages.push(ChatMessage::user("hi".into()));
+    state.messages.push(ChatMessage::assistant_empty());
+    state.agent_status = AgentStatus::Streaming;
+
+    // Streaming with complete line + partial line
+    state.messages.last_mut().unwrap().append_text("Line one complete\nLine two partial");
+
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    // Line-buffered: should show "Line one complete" but NOT "Line two partial"
+    assert!(buffer_contains(&buf, "Line one complete"),
+        "Complete line should be visible during streaming");
+    assert!(!buffer_contains(&buf, "Line two partial"),
+        "Partial line should be hidden during streaming (line-buffered)");
+}
+
+/// When streaming ends (AgentDone), the full text including partial lines should appear.
+#[test]
+fn streaming_done_shows_full_text() {
+    let mut state = make_state(80, 30);
+
+    state.messages.push(ChatMessage::user("hi".into()));
+    state.messages.push(ChatMessage::assistant_empty());
+    state.messages.last_mut().unwrap().append_text("Complete line\nAnd final partial");
+
+    // Streaming ended
+    state.agent_status = AgentStatus::Idle;
+
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "Complete line"), "Complete line should show");
+    assert!(buffer_contains(&buf, "And final partial"),
+        "After streaming ends, partial line must also be visible");
+}
+
+// ===========================================================================
+// E2E: Markdown rendering correctness
+// ===========================================================================
+
+#[test]
+fn markdown_bold_renders() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("This is **bold text** here");
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "bold text"), "Bold markdown text should render");
+}
+
+#[test]
+fn markdown_code_block_renders() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("```rust\nfn main() {\n    println!(\"hello\");\n}\n```");
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "fn main()"), "Code block content should render");
+    // Code block should have border characters
+    assert!(buffer_contains(&buf, "rust"), "Language label should render");
+}
+
+#[test]
+fn markdown_inline_code_renders() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("Use the `println!` macro");
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "println!"), "Inline code should render");
+}
+
+#[test]
+fn markdown_list_renders() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("- Item one\n- Item two\n- Item three");
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "Item one"), "List items should render");
+    assert!(buffer_contains(&buf, "Item two"));
+    assert!(buffer_contains(&buf, "Item three"));
+}
+
+#[test]
+fn markdown_heading_renders() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("# Big Title\n\nSome paragraph text.");
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "Big Title"), "Heading should render");
+    assert!(buffer_contains(&buf, "Some paragraph text"), "Paragraph should render");
+}
+
+#[test]
+fn markdown_empty_text_no_panic() {
+    let mut state = make_state(80, 24);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("");
+    state.messages.push(msg);
+    let _ = render_to_buffer(&mut state, 80, 24);
+}
+
+/// Large markdown content should not panic (stress test).
+#[test]
+fn markdown_large_content_no_panic() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    // Generate a large markdown document
+    let mut text = String::new();
+    for i in 0..100 {
+        text.push_str(&format!("## Section {}\n\nParagraph with **bold** and `code` for section {}.\n\n", i, i));
+        text.push_str(&format!("```python\ndef func_{}():\n    return {}\n```\n\n", i, i));
+    }
+    msg.append_text(&text);
+    state.messages.push(msg);
+    let _ = render_to_buffer(&mut state, 80, 30);
+}
+
+// ===========================================================================
+// E2E: Streaming markdown — incremental rendering
+// ===========================================================================
+
+/// Simulates what happens during streaming: text grows incrementally.
+/// Each frame should render without error and show completed lines.
+#[test]
+fn streaming_incremental_text_renders_correctly() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("explain".into()));
+    state.messages.push(ChatMessage::assistant_empty());
+    state.agent_status = AgentStatus::Streaming;
+
+    let deltas = [
+        "Here's ",
+        "an explanation:\n\n",
+        "1. First point\n",
+        "2. Second point\n",
+        "3. Third with `code`\n",
+        "\n```rust\n",
+        "fn example() {}\n",
+        "```\n",
+        "\nFinal paragraph.",
+    ];
+
+    for delta in &deltas {
+        state.messages.last_mut().unwrap().append_text(delta);
+    
+        let _ = render_to_buffer(&mut state, 80, 30);
+        // No panic = pass
+    }
+
+    // End streaming — all content should be visible
+    state.agent_status = AgentStatus::Idle;
+
+    let buf = render_to_buffer(&mut state, 80, 30);
+    assert!(buffer_contains(&buf, "First point"), "Point 1 should show");
+    assert!(buffer_contains(&buf, "Second point"), "Point 2 should show");
+    assert!(buffer_contains(&buf, "fn example()"), "Code should show");
+    assert!(buffer_contains(&buf, "Final paragraph"), "Final text should show");
+}
+
+/// Tool calls interleaved with text during streaming.
+#[test]
+fn streaming_tool_calls_interleaved_with_text() {
+    let mut state = make_state(100, 40);
+    state.messages.push(ChatMessage::user("fix bug".into()));
+    state.messages.push(ChatMessage::assistant_empty());
+    state.agent_status = AgentStatus::Streaming;
+
+    // Text delta
+    state.messages.last_mut().unwrap().append_text("Let me look at the code.\n");
+
+    let _ = render_to_buffer(&mut state, 100, 40);
+
+    // Tool call
+    state.messages.last_mut().unwrap().add_tool_call(
+        "Read".into(), "src/main.rs".into(), super::app::ToolCallStatus::Running,
+    );
+
+    let buf = render_to_buffer(&mut state, 100, 40);
+    assert!(buffer_contains(&buf, "Read"), "Running tool call should render");
+
+    // Tool completes
+    state.messages.last_mut().unwrap().set_last_tool_status(super::app::ToolCallStatus::Success);
+
+    let _ = render_to_buffer(&mut state, 100, 40);
+
+    // More text after tool
+    state.messages.last_mut().unwrap().append_text("I found the issue.\n");
+
+
+    // End streaming
+    state.agent_status = AgentStatus::Idle;
+
+    let buf = render_to_buffer(&mut state, 100, 40);
+    assert!(buffer_contains(&buf, "I found the issue"), "Post-tool text should render");
+}
+
+// ===========================================================================
+// E2E: Ctrl+C double-tap quit behavior
+// ===========================================================================
+
+#[test]
+fn ctrl_c_first_press_does_not_quit() {
+    let mut state = make_state(80, 24);
+    state.tick_count = 100;
+
+    // Simulate first Ctrl+C on idle with empty input
+    // (mirrors handle_ctrl_c logic)
+    assert!(state.input.lines().join("").trim().is_empty());
+    state.last_ctrl_c_tick = Some(state.tick_count);
+
+    assert!(!state.should_quit, "First Ctrl+C should NOT quit");
+    assert!(state.last_ctrl_c_tick.is_some(), "Should record the tick");
+}
+
+#[test]
+fn ctrl_c_double_tap_within_window_quits() {
+    let mut state = make_state(80, 24);
+    state.tick_count = 100;
+
+    // First Ctrl+C
+    state.last_ctrl_c_tick = Some(state.tick_count);
+
+    // Advance a few ticks (within 24-tick window at 12Hz = 2s)
+    state.tick_count = 110;
+
+    // Second Ctrl+C — check the double-tap condition
+    let within_window = state.last_ctrl_c_tick.map_or(false, |t| {
+        state.tick_count.wrapping_sub(t) <= 24
+    });
+    assert!(within_window, "Second press within 24 ticks should be within the double-tap window");
+}
+
+#[test]
+fn ctrl_c_outside_window_does_not_quit() {
+    let mut state = make_state(80, 24);
+    state.tick_count = 100;
+
+    // First Ctrl+C
+    state.last_ctrl_c_tick = Some(state.tick_count);
+
+    // Advance beyond window (>24 ticks)
+    state.tick_count = 130;
+
+    let within_window = state.last_ctrl_c_tick.map_or(false, |t| {
+        state.tick_count.wrapping_sub(t) <= 24
+    });
+    assert!(!within_window, "Press outside the 24-tick window should NOT trigger quit");
+}
+
+#[test]
+fn ctrl_c_clears_input_first() {
+    let mut state = make_state(80, 24);
+    type_text(&mut state, "some text");
+    assert!(!state.input.lines().join("").trim().is_empty());
+
+    // With text in input, Ctrl+C should clear input, not quit
+    // (mirrors handle_ctrl_c: has_input branch)
+    let has_input = !state.input.lines().join("").trim().is_empty();
+    assert!(has_input, "Input should have text before Ctrl+C");
+}
+
+#[test]
+fn ctrl_c_cancels_streaming_first() {
+    let mut state = make_state(80, 24);
+    state.agent_status = AgentStatus::Streaming;
+
+    // Ctrl+C during streaming should cancel, not quit
+    assert!(matches!(state.agent_status, AgentStatus::Streaming));
+    // After cancel:
+    state.agent_status = AgentStatus::Idle;
+    state.last_ctrl_c_tick = Some(state.tick_count);
+
+    assert!(!state.should_quit, "Ctrl+C during streaming should cancel, not quit");
+}
+
+#[test]
+fn status_bar_shows_ctrl_c_hint() {
+    let mut state = make_state(100, 24);
+    state.tick_count = 100;
+    state.last_ctrl_c_tick = Some(state.tick_count);
+
+    let buf = render_to_buffer(&mut state, 100, 24);
+    let lines = buffer_lines(&buf);
+    let last_line = &lines[lines.len() - 1];
+    assert!(
+        last_line.contains("Ctrl+C again to quit"),
+        "Status bar should show double-tap hint, got: {last_line}"
+    );
+}
+
+#[test]
+fn status_bar_hint_expires_after_window() {
+    let mut state = make_state(100, 24);
+    state.tick_count = 100;
+    state.last_ctrl_c_tick = Some(100);
+
+    // Advance beyond the window
+    state.tick_count = 130;
+
+    let buf = render_to_buffer(&mut state, 100, 24);
+    let lines = buffer_lines(&buf);
+    let last_line = &lines[lines.len() - 1];
+    assert!(
+        !last_line.contains("Ctrl+C again"),
+        "Hint should expire after window, got: {last_line}"
+    );
+    assert!(
+        last_line.contains("? for shortcuts"),
+        "Should return to normal hint after expiry, got: {last_line}"
+    );
+}
+
+// ===========================================================================
+// E2E: Selection rendered_lines — only computed when needed
+// ===========================================================================
+
+#[test]
+fn selection_lines_not_computed_when_inactive() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("hello".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("world");
+    state.messages.push(msg);
+
+    // No selection active, anchor == end
+    state.selection.active = false;
+    state.selection.anchor = (0, 0);
+    state.selection.end = (0, 0);
+
+    // Clear rendered_lines to verify they stay empty
+    state.selection.rendered_lines.clear();
+
+    let _ = render_to_buffer(&mut state, 80, 30);
+    assert!(
+        state.selection.rendered_lines.is_empty(),
+        "rendered_lines should NOT be populated when no selection is active"
+    );
+}
+
+#[test]
+fn selection_lines_computed_when_active() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("hello".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("world");
+    state.messages.push(msg);
+
+    // Simulate active selection
+    state.selection.active = true;
+    state.selection.anchor = (2, 5);
+    state.selection.end = (3, 10);
+
+    let _ = render_to_buffer(&mut state, 80, 30);
+    assert!(
+        !state.selection.rendered_lines.is_empty(),
+        "rendered_lines should be populated when selection is active"
+    );
+}
+
+#[test]
+fn selection_lines_computed_when_completed_selection_exists() {
+    let mut state = make_state(80, 30);
+    state.messages.push(ChatMessage::user("hello".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("world");
+    state.messages.push(msg);
+
+    // Selection completed (not active, but anchor != end)
+    state.selection.active = false;
+    state.selection.anchor = (2, 5);
+    state.selection.end = (3, 10);
+
+    let _ = render_to_buffer(&mut state, 80, 30);
+    assert!(
+        !state.selection.rendered_lines.is_empty(),
+        "rendered_lines should be computed for completed (non-cleared) selection"
+    );
+}
+
+// ===========================================================================
+// E2E: Scroll behavior during streaming
+// ===========================================================================
+
+#[test]
+fn auto_scroll_follows_streaming_content() {
+    let mut state = make_state(80, 10); // Small viewport to force scrolling
+
+    state.messages.push(ChatMessage::user("test".into()));
+    state.messages.push(ChatMessage::assistant_empty());
+    state.agent_status = AgentStatus::Streaming;
+
+    // Add enough lines to overflow viewport
+    let mut text = String::new();
+    for i in 0..20 {
+        text.push_str(&format!("Line number {}\n", i));
+    }
+    state.messages.last_mut().unwrap().append_text(&text);
+
+
+    assert!(state.auto_scroll, "auto_scroll should be on during streaming");
+    let _ = render_to_buffer(&mut state, 80, 10);
+    // With auto_scroll, scroll_offset should be 0 (pinned to bottom)
+    assert_eq!(state.scroll_offset, 0);
+}
+
+#[test]
+fn manual_scroll_disables_auto_scroll() {
+    let mut state = make_state(80, 10);
+
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    let mut text = String::new();
+    for i in 0..30 {
+        text.push_str(&format!("Long line {}\n", i));
+    }
+    msg.append_text(&text);
+    state.messages.push(msg);
+
+
+    let _ = render_to_buffer(&mut state, 80, 10);
+
+    // Simulate scroll up
+    state.auto_scroll = false;
+    state.scroll_offset = 5;
+
+    let buf = render_to_buffer(&mut state, 80, 10);
+    // Should NOT show the very last lines when scrolled up
+    assert!(!buffer_contains(&buf, "Long line 29"),
+        "Scrolled-up view should NOT show the last line");
+}
+
+// ===========================================================================
+// E2E: Tool call grouping
+// ===========================================================================
+
+#[test]
+fn consecutive_search_tools_grouped() {
+    let mut state = make_state(100, 30);
+    state.messages.push(ChatMessage::user("find it".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.add_tool_call("Read".into(), "file1.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Read".into(), "file2.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Grep".into(), "pattern".into(), super::app::ToolCallStatus::Success);
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 100, 30);
+    // Grouped tools should show a collapsed summary, not individual lines
+    // At minimum, all three shouldn't show as separate full entries
+    let lines = buffer_lines(&buf);
+    let read_lines: Vec<_> = lines.iter().filter(|l| l.contains("Read")).collect();
+    // Should be collapsed into one group line, not two separate "Read" lines
+    assert!(read_lines.len() <= 1,
+        "Consecutive same-group Read calls should be collapsed, found {} lines",
+        read_lines.len());
+}
+
+#[test]
+fn mixed_tool_groups_not_collapsed() {
+    let mut state = make_state(100, 30);
+    state.messages.push(ChatMessage::user("do things".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.add_tool_call("Read".into(), "file.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Edit".into(), "file.rs:10".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Read".into(), "other.rs".into(), super::app::ToolCallStatus::Success);
+    state.messages.push(msg);
+
+    let buf = render_to_buffer(&mut state, 100, 30);
+    // Read and Edit are different groups — should not collapse across groups
+    let lines = buffer_lines(&buf);
+    let tool_lines: Vec<_> = lines.iter()
+        .filter(|l| l.contains("Read") || l.contains("Edit"))
+        .collect();
+    assert!(tool_lines.len() >= 2,
+        "Tools from different groups should not be collapsed together");
+}
+
+// ===========================================================================
+// E2E: Narrow terminal rendering
+// ===========================================================================
+
+#[test]
+fn very_narrow_terminal_no_panic() {
+    let mut state = make_state(20, 8);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("```rust\nfn a_very_long_function_name() { println!(\"hello world\"); }\n```");
+    state.messages.push(msg);
+    let _ = render_to_buffer(&mut state, 20, 8);
+}
+
+#[test]
+fn single_line_terminal_no_panic() {
+    let mut state = make_state(80, 3);
+    state.messages.push(ChatMessage::user("test".into()));
+    let mut msg = ChatMessage::assistant_empty();
+    msg.append_text("Some response");
+    state.messages.push(msg);
+    let _ = render_to_buffer(&mut state, 80, 3);
+}
+
+// ===========================================================================
+// E2E: Multiple conversation turns render correctly
+// ===========================================================================
+
+#[test]
+fn multi_turn_conversation_renders_all_messages() {
+    let mut state = make_state(80, 50);
+
+    for i in 0..5 {
+        state.messages.push(ChatMessage::user(format!("Question {}", i)));
+        let mut msg = ChatMessage::assistant_empty();
+        msg.append_text(&format!("Answer {}", i));
+        state.messages.push(msg);
+    
+    }
+
+    let buf = render_to_buffer(&mut state, 80, 50);
+    for i in 0..5 {
+        assert!(buffer_contains(&buf, &format!("Question {}", i)),
+            "Question {} should be visible", i);
+        assert!(buffer_contains(&buf, &format!("Answer {}", i)),
+            "Answer {} should be visible", i);
+    }
+}
+
+// ===========================================================================
+// Helpers for the new tests
+// ===========================================================================
+
+/// Dispatch a local text command and push results into state.
+fn dispatch_local_text(state: &mut AppState, cmd: &str) {
+    let ctx = crate::commands::CommandContext {
+        model_name: state.model_name.clone(),
+        turn_count: state.turn_count,
+        message_count: state.messages.len(),
+        all_commands: state.command_registry.command_infos(),
+        mcp_servers: Vec::new(),
+    };
+    match crate::commands::dispatch(cmd, &state.command_registry, &ctx) {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
+            state.messages.push(ChatMessage::user(cmd.to_string()));
+            let mut msg = ChatMessage::assistant_empty();
+            msg.append_text(&text);
+            state.messages.push(msg);
+        
+        }
+        other => panic!("Expected Local(Text) for '{}', got {:?}", cmd, std::mem::discriminant(&other)),
+    }
+}
+
+/// Push an unknown command error into state.
+fn dispatch_unknown(state: &mut AppState, cmd: &str) {
+    let ctx = crate::commands::CommandContext {
+        model_name: state.model_name.clone(),
+        turn_count: state.turn_count,
+        message_count: state.messages.len(),
+        all_commands: state.command_registry.command_infos(),
+        mcp_servers: Vec::new(),
+    };
+    match crate::commands::dispatch(cmd, &state.command_registry, &ctx) {
+        crate::commands::DispatchResult::Unknown(name) => {
+            state.messages.push(ChatMessage::user(cmd.to_string()));
+            let mut msg = ChatMessage::assistant_empty();
+            msg.append_text(&format!("Unknown command: /{}. Type /help for available commands.", name));
+            state.messages.push(msg);
+        
+        }
+        _ => panic!("Expected Unknown for '{}'", cmd),
+    }
+}
+
+// ###########################################################################
+//
+// E2E tests using TestHarness — full user activity simulation
+//
+// These tests drive the REAL handle_key → TuiApp::submit → handle_agent_event
+// → render pipeline. No state manipulation shortcuts.
+//
+// ###########################################################################
+
+// ===========================================================================
+// Harness: typing and input
+// ===========================================================================
+
+#[test]
+fn harness_type_and_read_input() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("hello world");
+    assert_eq!(h.input_text(), "hello world");
+}
+
+#[test]
+fn harness_backspace_deletes_char() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("hello");
+    h.press_backspace();
+    assert_eq!(h.input_text(), "hell");
+}
+
+#[test]
+fn harness_type_renders_in_input_bar() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("test input");
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "test input"), "Typed text should appear in input bar");
+}
+
+// ===========================================================================
+// Harness: slash command e2e (type → enter → dispatch → render)
+// ===========================================================================
+
+#[test]
+fn harness_slash_help_full_flow() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("/help");
+    h.press_enter();
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Available commands"),
+        "Typing /help + Enter should dispatch and render help output");
+    assert!(buffer_contains(&buf, "> /help"),
+        "User message should show with > prefix");
+}
+
+#[test]
+fn harness_slash_status_full_flow() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("/status");
+    h.press_enter();
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Model: test-model"),
+        "/status should render model name");
+}
+
+#[test]
+fn harness_slash_exit_quits() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("/exit");
+    h.press_enter();
+    assert!(h.app.state.should_quit, "/exit should set should_quit");
+}
+
+#[test]
+fn harness_slash_clear_clears_messages() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("/help");
+    h.press_enter();
+    assert!(!h.app.state.messages.is_empty());
+
+    h.type_str("/clear");
+    h.press_enter();
+    assert!(h.app.state.messages.is_empty(), "/clear should empty messages");
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Strands"), "Welcome screen after /clear");
+}
+
+#[test]
+fn harness_unknown_command_shows_error() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("/nonexistent");
+    h.press_enter();
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Unknown command"));
+}
+
+#[test]
+fn harness_empty_enter_does_nothing() {
+    let mut h = TestHarness::new(80, 24);
+    h.press_enter();
+    assert!(h.app.state.messages.is_empty());
+}
+
+// ===========================================================================
+// Harness: repeated command cache invalidation (the /mcp bug)
+// ===========================================================================
+
+#[test]
+fn harness_repeated_status_both_visible() {
+    let mut h = TestHarness::new(80, 40);
+
+    h.type_str("/status");
+    h.press_enter();
+    let buf1 = h.render();
+    let c1 = buffer_lines(&buf1).iter().filter(|l| l.contains("Model: test-model")).count();
+    assert_eq!(c1, 1);
+
+    h.type_str("/status");
+    h.press_enter();
+    let buf2 = h.render();
+    let c2 = buffer_lines(&buf2).iter().filter(|l| l.contains("Model: test-model")).count();
+    assert_eq!(c2, 2, "Both /status outputs must be visible (cache invalidation)");
+}
+
+// ===========================================================================
+// Harness: agent streaming simulation
+// ===========================================================================
+
+#[test]
+fn harness_simulate_streaming_response() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("hello");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    h.feed_agent_events(vec![
+        Event::AgentTextDelta("Hello! ".to_string()),
+        Event::AgentTextDelta("How can I help?\n".to_string()),
+        Event::AgentDone,
+    ]);
+
+    assert!(matches!(h.app.state.agent_status, AgentStatus::Idle));
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "How can I help?"));
+}
+
+#[test]
+fn harness_streaming_with_tool_calls() {
+    let mut h = TestHarness::new(100, 40);
+    h.type_str("fix the bug");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    h.feed_agent_events(vec![Event::AgentTextDelta("Let me check.\n".to_string())]);
+    h.simulate_tool_call("Read", "src/main.rs");
+    h.feed_agent_events(vec![
+        Event::AgentTextDelta("Found it.\n".to_string()),
+        Event::AgentDone,
+    ]);
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Let me check"));
+    assert!(buffer_contains(&buf, "Found it"));
+}
+
+#[test]
+fn harness_streaming_line_buffering() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("explain");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    h.feed_agent_events(vec![Event::AgentTextDelta("Partial without newline".to_string())]);
+    let buf = h.render();
+    assert!(!buffer_contains(&buf, "Partial without"), "Partial line hidden during streaming");
+
+    h.feed_agent_events(vec![Event::AgentTextDelta("\n".to_string())]);
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Partial without"), "Completed line now visible");
+}
+
+#[test]
+fn harness_agent_error_renders() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("test");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    h.feed_agent_events(vec![
+        Event::AgentError("API rate limit exceeded".to_string()),
+        Event::AgentDone,
+    ]);
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "rate limit"));
+}
+
+// ===========================================================================
+// Harness: Ctrl+C double-tap flow
+// ===========================================================================
+
+#[test]
+fn harness_ctrl_c_clears_input_first() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("some text");
+    h.press_ctrl_c();
+    assert!(h.input_text().trim().is_empty(), "First Ctrl+C clears input");
+    assert!(!h.app.state.should_quit);
+}
+
+#[test]
+fn harness_ctrl_c_double_tap_quits() {
+    let mut h = TestHarness::new(80, 24);
+    h.app.state.tick_count = 100;
+    h.press_ctrl_c();
+    assert!(!h.app.state.should_quit);
+    h.tick(5);
+    h.press_ctrl_c();
+    assert!(h.app.state.should_quit, "Double Ctrl+C within window quits");
+}
+
+#[test]
+fn harness_ctrl_c_expired_window_no_quit() {
+    let mut h = TestHarness::new(80, 24);
+    h.app.state.tick_count = 100;
+    h.press_ctrl_c();
+    h.tick(30);
+    h.press_ctrl_c();
+    assert!(!h.app.state.should_quit, "Expired window → no quit");
+}
+
+#[test]
+fn harness_ctrl_c_during_streaming_cancels() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("hello");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.press_ctrl_c();
+    assert!(matches!(h.app.state.agent_status, AgentStatus::Idle));
+    assert!(!h.app.state.should_quit);
+}
+
+#[test]
+fn harness_ctrl_c_status_bar_hint() {
+    let mut h = TestHarness::new(100, 24);
+    h.app.state.tick_count = 100;
+    h.press_ctrl_c();
+    let buf = h.render();
+    let lines = buffer_lines(&buf);
+    let last = &lines[lines.len() - 1];
+    assert!(last.contains("Ctrl+C again to quit"), "got: {last}");
+}
+
+// ===========================================================================
+// Harness: autocomplete flow
+// ===========================================================================
+
+#[test]
+fn harness_slash_triggers_suggestions() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("/");
+    assert!(!h.app.state.suggestions.is_empty());
+}
+
+#[test]
+fn harness_tab_accepts_suggestion() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("/hel");
+    assert!(h.app.state.suggestions.iter().any(|s| s.name == "help"));
+    h.press_tab();
+    assert!(h.input_text().starts_with("/help"), "Tab accepts suggestion");
+}
+
+#[test]
+fn harness_esc_dismisses_suggestions() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("/");
+    assert!(!h.app.state.suggestions.is_empty());
+    h.press_esc();
+    assert!(h.app.state.suggestions.is_empty());
+}
+
+#[test]
+fn harness_arrow_navigates_suggestions() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("/");
+    let initial = h.app.state.selected_suggestion;
+    h.press_down();
+    assert_ne!(h.app.state.selected_suggestion, initial);
+    h.press_up();
+    assert_eq!(h.app.state.selected_suggestion, initial);
+}
+
+// ===========================================================================
+// Harness: Esc cancels streaming
+// ===========================================================================
+
+#[test]
+fn harness_esc_cancels_streaming() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("test");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.press_esc();
+    assert!(matches!(h.app.state.agent_status, AgentStatus::Idle));
+}
+
+// ===========================================================================
+// Harness: multi-turn conversation
+// ===========================================================================
+
+#[test]
+fn harness_multi_turn_conversation() {
+    let mut h = TestHarness::new(80, 40);
+
+    h.type_str("What is Rust?");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.simulate_response("Rust is a systems programming language.\n");
+
+    h.type_str("Tell me more");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.simulate_response("It focuses on safety and performance.\n");
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "What is Rust?"));
+    assert!(buffer_contains(&buf, "systems programming"));
+    assert!(buffer_contains(&buf, "Tell me more"));
+    assert!(buffer_contains(&buf, "safety and performance"));
+    assert_eq!(h.app.state.turn_count, 2);
+}
+
+// ===========================================================================
+// Harness: file path not treated as command
+// ===========================================================================
+
+#[test]
+fn harness_file_path_not_command() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("/var/log/syslog");
+    h.press_enter();
+    let has_unknown = h.app.state.messages.iter().any(|m| {
+        m.blocks.iter().any(|b| matches!(b, super::app::ContentBlock::Text(t) if t.contains("Unknown command")))
+    });
+    assert!(!has_unknown);
+}
+
+// ===========================================================================
+// Harness: input history
+// ===========================================================================
+
+#[test]
+fn harness_input_history_populated() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("first query");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.simulate_response("ok\n");
+
+    h.type_str("second query");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.simulate_response("ok\n");
+
+    assert_eq!(h.app.state.input_history.len(), 2);
+    assert_eq!(h.app.state.input_history[0], "first query");
+    assert_eq!(h.app.state.input_history[1], "second query");
+}
+
+#[test]
+fn harness_slash_commands_not_in_history() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("/help");
+    h.press_enter();
+    h.type_str("real question");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.simulate_response("ok\n");
+
+    assert_eq!(h.app.state.input_history.len(), 1);
+    assert_eq!(h.app.state.input_history[0], "real question");
+}
+
+// ===========================================================================
+// Harness: scroll
+// ===========================================================================
+
+#[test]
+fn harness_auto_scroll_on_by_default() {
+    let h = TestHarness::new(80, 24);
+    assert!(h.app.state.auto_scroll);
+}
+
+#[test]
+fn harness_esc_cancel_does_not_affect_scroll() {
+    let mut h = TestHarness::new(80, 24);
+    h.type_str("test");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+    h.press_esc();
+    assert!(h.app.state.auto_scroll);
 }

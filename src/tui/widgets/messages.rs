@@ -1,14 +1,37 @@
 //! Message history widget — renders all chat messages as scrollable content.
+//!
+//! Performance architecture (mirrors Claude Code's 4-layer approach):
+//!
+//! 1. **Per-message cache**: Each message's rendered lines are cached and validated
+//!    by fingerprint (block_count, text_len, width). Old messages never re-render.
+//! 2. **Incremental streaming markdown**: The streaming message's last text block
+//!    tracks a "stable prefix boundary". Only the unstable suffix after the last
+//!    complete markdown block is re-parsed each frame.
+//! 3. **Viewport slicing**: Only messages overlapping the visible viewport (+overscan)
+//!    have their lines cloned into the final Paragraph. Off-screen messages contribute
+//!    only their line count for scroll math.
+//! 4. **Eliminated redundant clones**: Per-message caches store owned lines. Assembly
+//!    only clones lines for visible messages, not the entire history.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
-use crate::tui::app::{AgentStatus, AppState, CachedRender, ChatMessage, ContentBlock, Role, ToolCallStatus};
-use crate::tui::widgets::markdown::markdown_to_lines;
+use crate::tui::app::{
+    AgentStatus, AppState, ChatMessage, ContentBlock, MessageCacheEntry, Role,
+    StreamingMdCache, ToolCallStatus,
+};
+use crate::tui::widgets::markdown::{find_stable_boundary, markdown_to_lines};
 use crate::tui::widgets::tool_call::{render_tool_call, render_tool_call_group};
+
+/// Left margin prefix for all message content.
+const MARGIN: &str = "  ";
+
+/// Extra lines rendered above/below the visible viewport.
+const OVERSCAN: u16 = 40;
 
 pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
     // Store the messages area for selection coordinate mapping
@@ -16,40 +39,7 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
 
     // Welcome header when no messages
     if state.messages.is_empty() {
-        let welcome = vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "  Strands",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " CLI",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Model: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    state.model_name.clone(),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Type a message and press Enter to start.",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "  /help for commands \u{2502} /clear to reset \u{2502} /exit to quit",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
+        let welcome = render_welcome(&state.model_name);
         state.selection.rendered_lines = welcome.iter().map(line_to_plain_text).collect();
         state.selection.rendered_y_scroll = 0;
         let para = Paragraph::new(welcome);
@@ -57,108 +47,85 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // --- Virtual scroll: use cached rendered lines when possible ---
-    // Key optimization: during streaming, cache all messages EXCEPT the last
-    // (streaming) one, and only re-render that last message each frame.
-    // Previously, the entire cache was bypassed during streaming, causing
-    // markdown parsing + syntax highlighting for ALL messages on every frame.
     let is_streaming = matches!(state.agent_status, AgentStatus::Streaming);
-    let cache_valid = state.cached_render.as_ref().map_or(false, |c| {
-        c.message_gen == state.message_gen && c.terminal_width == state.terminal_width
-    });
+    let msg_count = state.messages.len();
+    let width = state.terminal_width;
 
-    let all_lines = if cache_valid {
-        // Fully cached (idle state) — reuse as-is
-        state.cached_render.as_ref().unwrap().lines.clone()
-    } else if is_streaming && state.messages.len() >= 2 {
-        // Streaming optimization: cache all messages except the last one.
-        // Only re-render the last (actively streaming) assistant message.
-        let msg_count = state.messages.len();
-        let stable_count = msg_count - 1; // all except the streaming message
+    // ---------------------------------------------------------------
+    // Pass 1: Ensure per-message caches are up-to-date.
+    //         Collect per-message line counts for scroll math.
+    // ---------------------------------------------------------------
 
-        // Check if we have a valid partial cache for the stable messages
-        let stable_gen = state.message_gen.wrapping_sub(1); // approximate: gen before last mutation
-        let stable_cache_valid = state.cached_render.as_ref().map_or(false, |c| {
-            c.terminal_width == state.terminal_width
-                && c.lines.len() > 0
-        });
+    // Sync cache vector length with messages
+    while state.message_cache.len() < msg_count {
+        state.message_cache.push(None);
+    }
+    state.message_cache.truncate(msg_count);
 
-        let mut lines: Vec<Line<'static>> = if stable_cache_valid {
-            // Reuse cached stable lines (skip re-rendering old messages)
-            state.cached_render.as_ref().unwrap().lines.clone()
+    // Per-message line counts (used for viewport slicing + total line calculation)
+    let mut line_counts: Vec<u16> = Vec::with_capacity(msg_count);
+
+    // The area width used for wrap calculations. Paragraph with Wrap wraps
+    // at this width, so we must count wrapped (visual) lines, not logical ones.
+    // On narrow terminals (mobile), lines wrap frequently — using logical counts
+    // would make y_scroll too small, causing content to appear stuck under the input.
+    let wrap_width = area.width;
+
+    for i in 0..msg_count {
+        let is_last_streaming = i == msg_count - 1 && is_streaming;
+
+        if is_last_streaming {
+            // Streaming message: use incremental renderer (not per-message cache)
+            let lines = render_streaming_message(
+                &state.messages[i],
+                &mut state.streaming_md_cache,
+                state.tick_count,
+                width,
+            );
+            let count = count_wrapped_lines(&lines, wrap_width);
+            line_counts.push(count);
+            // Store in message_cache slot temporarily for Pass 2
+            state.message_cache[i] = Some(MessageCacheEntry {
+                lines,
+                block_count: 0,
+                text_len: 0,
+                width: 0, // fingerprint intentionally invalid so it's never reused as-is
+            });
         } else {
-            // Build stable lines from scratch (first frame of streaming)
-            let mut stable_lines: Vec<Line<'static>> = Vec::new();
-            for (idx, msg) in state.messages[..stable_count].iter().enumerate() {
-                if !stable_lines.is_empty() {
-                    stable_lines.push(Line::from(""));
-                }
-                render_unseen_divider(state, &mut stable_lines);
-                stable_lines.extend(render_message(msg, state.tick_count, state.terminal_width));
+            // Check per-message cache validity
+            let valid = state.message_cache[i]
+                .as_ref()
+                .map_or(false, |c| c.is_valid(&state.messages[i], width));
+
+            if !valid {
+                let lines = render_message(&state.messages[i], state.tick_count, width);
+                state.message_cache[i] = Some(MessageCacheEntry::new(
+                    lines,
+                    &state.messages[i],
+                    width,
+                ));
             }
-            // Cache the stable portion for subsequent frames
-            state.cached_render = Some(CachedRender {
-                lines: stable_lines.clone(),
-                message_gen: stable_gen,
-                terminal_width: state.terminal_width,
-            });
-            stable_lines
-        };
 
-        // Append separator + the streaming message (re-rendered each frame)
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
+            let count = count_wrapped_lines(
+                &state.message_cache[i].as_ref().unwrap().lines,
+                wrap_width,
+            );
+            line_counts.push(count);
         }
-        let last_msg = &state.messages[msg_count - 1];
-        lines.extend(render_message_streaming(last_msg, state.tick_count, state.terminal_width));
+    }
 
-        // Bottom padding
-        lines.push(Line::from(""));
-        lines
-    } else {
-        // Full rebuild (no cache, not streaming, or only 1 message)
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let msg_count = state.messages.len();
+    // ---------------------------------------------------------------
+    // Scroll math (using wrapped/visual line counts)
+    // ---------------------------------------------------------------
 
-        for (idx, msg) in state.messages.iter().enumerate() {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            render_unseen_divider(state, &mut lines);
+    // Total visual lines = sum of wrapped per-message lines + separators + bottom padding
+    let separator_lines = if msg_count > 1 { (msg_count - 1) as u16 } else { 0 };
+    let total_lines: u16 = line_counts.iter().copied().sum::<u16>()
+        .saturating_add(separator_lines)
+        .saturating_add(1); // bottom padding
 
-            let is_last_assistant = idx == msg_count - 1
-                && matches!(msg.role, Role::Assistant)
-                && is_streaming;
-
-            if is_last_assistant {
-                lines.extend(render_message_streaming(msg, state.tick_count, state.terminal_width));
-            } else {
-                lines.extend(render_message(msg, state.tick_count, state.terminal_width));
-            }
-        }
-
-        // Bottom padding
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
-        }
-
-        // Update cache when not streaming
-        if !is_streaming {
-            state.cached_render = Some(CachedRender {
-                lines: lines.clone(),
-                message_gen: state.message_gen,
-                terminal_width: state.terminal_width,
-            });
-        }
-
-        lines
-    };
-
-    let total_lines = all_lines.len() as u16;
     state.total_lines = total_lines;
     let visible = area.height;
-
-    // scroll_offset=0 means pinned to bottom
     let max_offset = total_lines.saturating_sub(visible);
     let y_scroll = if state.auto_scroll {
         max_offset
@@ -166,8 +133,60 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
         max_offset.saturating_sub(state.scroll_offset)
     };
 
-    // Only compute plain-text lines for selection when a selection is active or just completed
-    // (avoids expensive per-frame string allocation when not selecting)
+    // ---------------------------------------------------------------
+    // Pass 2: Viewport slicing — only clone lines for visible messages.
+    //         Off-screen messages contribute placeholder empty lines
+    //         to preserve scroll position math.
+    // ---------------------------------------------------------------
+
+    let view_start = y_scroll.saturating_sub(OVERSCAN);
+    let view_end = (y_scroll + visible).saturating_add(OVERSCAN).min(total_lines);
+
+    let mut all_lines: Vec<Line<'static>> = Vec::with_capacity(total_lines as usize);
+    let mut cumulative: u16 = 0;
+
+    for i in 0..msg_count {
+        // Separator between messages
+        if i > 0 {
+            let sep_pos = cumulative;
+            cumulative += 1;
+            if sep_pos >= view_start && sep_pos < view_end {
+                all_lines.push(Line::from(""));
+            } else {
+                all_lines.push(Line::from("")); // placeholder (cheap)
+            }
+        }
+
+        let msg_line_count = line_counts[i];
+        let msg_start = cumulative;
+        let msg_end = cumulative + msg_line_count;
+
+        // Check if this message overlaps the visible viewport (with overscan)
+        let is_visible = msg_end > view_start && msg_start < view_end;
+
+        if is_visible {
+            // Clone lines from cache into the output
+            if let Some(ref entry) = state.message_cache[i] {
+                all_lines.extend(entry.lines.iter().cloned());
+            }
+        } else {
+            // Off-screen: push cheap placeholder lines to maintain correct total count
+            for _ in 0..msg_line_count {
+                all_lines.push(Line::from(""));
+            }
+        }
+
+        cumulative = msg_end;
+    }
+
+    // Bottom padding
+    all_lines.push(Line::from(""));
+
+    // ---------------------------------------------------------------
+    // Render
+    // ---------------------------------------------------------------
+
+    // Selection text extraction (only when actively selecting)
     if state.selection.active || state.selection.anchor != state.selection.end {
         state.selection.rendered_lines = all_lines.iter().map(line_to_plain_text).collect();
     }
@@ -179,13 +198,13 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
 
     frame.render_widget(paragraph, area);
 
-    // Render selection highlight overlay
+    // Selection highlight overlay
     render_selection_highlight(state, frame, area, y_scroll);
 
     // Scrollbar
     if total_lines > visible {
-        let mut scrollbar_state = ScrollbarState::new(max_offset as usize)
-            .position(y_scroll as usize);
+        let mut scrollbar_state =
+            ScrollbarState::new(max_offset as usize).position(y_scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,
@@ -194,114 +213,11 @@ pub fn render_messages(state: &mut AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
-/// Convert a ratatui Line to plain text for selection extraction.
-fn line_to_plain_text(line: &Line<'_>) -> String {
-    let mut s = String::new();
-    for span in line.spans.iter() {
-        s.push_str(span.content.as_ref());
-    }
-    s
-}
+// ---------------------------------------------------------------------------
+// Message rendering
+// ---------------------------------------------------------------------------
 
-/// Render the selection highlight as an overlay on the messages area.
-fn render_selection_highlight(state: &AppState, frame: &mut Frame, area: Rect, _y_scroll: u16) {
-    let sel = &state.selection;
-    if sel.anchor == sel.end && !sel.active {
-        return;
-    }
-
-    let ((sr, sc), (er, ec)) = sel.ordered();
-
-    // Only highlight within the messages area
-    for row in sr..=er {
-        if row < area.y || row >= area.y + area.height {
-            continue;
-        }
-
-        let col_start = if row == sr { sc } else { area.x };
-        let col_end = if row == er {
-            (ec + 1).min(area.x + area.width)
-        } else {
-            area.x + area.width
-        };
-
-        if col_start >= col_end {
-            continue;
-        }
-
-        // Read existing cells and re-render with inverted style
-        let buf = frame.buffer_mut();
-        for col in col_start..col_end {
-            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(col, row)) {
-                // Swap fg/bg for selection highlight
-                let fg = cell.fg;
-                let bg = cell.bg;
-                cell.set_fg(if bg == Color::Reset { Color::Black } else { bg });
-                cell.set_bg(if fg == Color::Reset { Color::White } else { fg });
-            }
-        }
-    }
-}
-
-/// Insert an "unseen messages" divider line if conditions are met.
-fn render_unseen_divider(state: &AppState, lines: &mut Vec<Line<'static>>) {
-    if let Some(unseen_line) = state.unseen_from_line {
-        if lines.len() >= unseen_line && state.unseen_message_count > 0 {
-            let already_inserted = lines.iter().any(|l| {
-                l.spans.iter().any(|s| s.content.contains("new message"))
-            });
-            if !already_inserted {
-                let label = if state.unseen_message_count == 1 {
-                    " 1 new message ".to_string()
-                } else {
-                    format!(" {} new messages ", state.unseen_message_count)
-                };
-                let dash_count = (state.terminal_width as usize)
-                    .saturating_sub(label.len() + 4) / 2;
-                let dashes = "\u{2500}".repeat(dash_count);
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {}", dashes),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        label,
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        dashes,
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ]));
-                lines.push(Line::from(""));
-            }
-        }
-    }
-}
-
-/// Render the last assistant message during streaming — truncates text at the last
-/// newline so text appears line-by-line, not character-by-character.
-/// Mirrors Claude Code's `visibleStreamingText` pattern.
-fn render_message_streaming(msg: &ChatMessage, tick: usize, max_width: u16) -> Vec<Line<'static>> {
-    let mut truncated = msg.clone();
-    // Find the last Text block and truncate at last newline
-    for block in truncated.blocks.iter_mut().rev() {
-        if let ContentBlock::Text(ref mut text) = block {
-            if let Some(last_nl) = text.rfind('\n') {
-                text.truncate(last_nl + 1);
-            } else {
-                // No newline yet — hide the partial line entirely
-                text.clear();
-            }
-            break;
-        }
-    }
-    render_message(&truncated, tick, max_width)
-}
-
-/// Left margin prefix for all message content.
-const MARGIN: &str = "  ";
-
+/// Render a single settled (non-streaming) message into styled lines.
 fn render_message(msg: &ChatMessage, tick: usize, max_width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let margin = Span::raw(MARGIN);
@@ -329,65 +245,321 @@ fn render_message(msg: &ChatMessage, tick: usize, max_width: u16) -> Vec<Line<'s
             }
         }
         Role::Assistant => {
-            let blocks = &msg.blocks;
-            let mut i = 0;
-            while i < blocks.len() {
-                match &blocks[i] {
-                    ContentBlock::Text(text) => {
-                        if !text.is_empty() {
-                            for mut line in markdown_to_lines(text, max_width.saturating_sub(MARGIN.len() as u16)) {
-                                line.spans.insert(0, margin.clone());
-                                lines.push(line);
-                            }
-                        }
-                        i += 1;
+            render_assistant_blocks(&msg.blocks, tick, max_width, &margin, &mut lines);
+        }
+    }
+
+    lines
+}
+
+/// Render assistant message content blocks (text + tool calls with grouping).
+fn render_assistant_blocks(
+    blocks: &[ContentBlock],
+    tick: usize,
+    max_width: u16,
+    margin: &Span<'static>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let mut i = 0;
+    while i < blocks.len() {
+        match &blocks[i] {
+            ContentBlock::Text(text) => {
+                if !text.is_empty() {
+                    let md_width = max_width.saturating_sub(MARGIN.len() as u16);
+                    for mut line in markdown_to_lines(text, md_width) {
+                        line.spans.insert(0, margin.clone());
+                        lines.push(line);
                     }
-                    ContentBlock::ToolCall {
-                        name,
-                        summary,
-                        status,
-                        group_key,
-                    } => {
-                        // Try to collapse consecutive same-group successful tool calls
-                        if let Some(gk) = group_key {
-                            if *status == ToolCallStatus::Success {
-                                let mut run: Vec<(&str, &str)> =
-                                    vec![(name.as_str(), summary.as_str())];
-                                let mut j = i + 1;
-                                while j < blocks.len() {
-                                    if let ContentBlock::ToolCall {
-                                        name: n2,
-                                        summary: s2,
-                                        status: st2,
-                                        group_key: Some(gk2),
-                                    } = &blocks[j]
-                                    {
-                                        if gk2 == gk && *st2 == ToolCallStatus::Success {
-                                            run.push((n2.as_str(), s2.as_str()));
-                                            j += 1;
-                                            continue;
-                                        }
-                                    }
-                                    break;
-                                }
-                                if run.len() > 1 {
-                                    let mut line = render_tool_call_group(&run);
-                                    line.spans.insert(0, margin.clone());
-                                    lines.push(line);
-                                    i = j;
+                }
+                i += 1;
+            }
+            ContentBlock::ToolCall {
+                name,
+                summary,
+                status,
+                group_key,
+            } => {
+                // Try to collapse consecutive same-group successful tool calls
+                if let Some(gk) = group_key {
+                    if *status == ToolCallStatus::Success {
+                        let mut run: Vec<(&str, &str)> =
+                            vec![(name.as_str(), summary.as_str())];
+                        let mut j = i + 1;
+                        while j < blocks.len() {
+                            if let ContentBlock::ToolCall {
+                                name: n2,
+                                summary: s2,
+                                status: st2,
+                                group_key: Some(gk2),
+                            } = &blocks[j]
+                            {
+                                if gk2 == gk && *st2 == ToolCallStatus::Success {
+                                    run.push((n2.as_str(), s2.as_str()));
+                                    j += 1;
                                     continue;
                                 }
                             }
+                            break;
                         }
-                        let mut line = render_tool_call(name, summary, status, tick);
-                        line.spans.insert(0, margin.clone());
-                        lines.push(line);
-                        i += 1;
+                        if run.len() > 1 {
+                            let mut line = render_tool_call_group(&run);
+                            line.spans.insert(0, margin.clone());
+                            lines.push(line);
+                            i = j;
+                            continue;
+                        }
                     }
                 }
+                let mut line = render_tool_call(name, summary, status, tick);
+                line.spans.insert(0, margin.clone());
+                lines.push(line);
+                i += 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming message: incremental markdown rendering (Layer 2)
+// ---------------------------------------------------------------------------
+
+/// Render the actively streaming message using incremental markdown caching.
+///
+/// For the last (growing) text block:
+/// 1. Find the stable prefix boundary (last `\n\n` outside code fences)
+/// 2. Reuse cached lines for text before the boundary
+/// 3. Only re-parse markdown for text after the boundary
+/// 4. Apply line-buffering: truncate the unstable suffix at the last newline
+///
+/// All other blocks (earlier text blocks, tool calls) are rendered normally.
+fn render_streaming_message(
+    msg: &ChatMessage,
+    streaming_cache: &mut Option<StreamingMdCache>,
+    tick: usize,
+    max_width: u16,
+) -> Vec<Line<'static>> {
+    let margin = Span::raw(MARGIN);
+    let mut lines = Vec::new();
+    let md_width = max_width.saturating_sub(MARGIN.len() as u16);
+
+    // Find the index of the last Text block (the one actively growing)
+    let last_text_idx = msg
+        .blocks
+        .iter()
+        .rposition(|b| matches!(b, ContentBlock::Text(_)));
+
+    for (block_idx, block) in msg.blocks.iter().enumerate() {
+        match block {
+            ContentBlock::Text(text) if Some(block_idx) == last_text_idx => {
+                // This is the growing text block — use incremental rendering
+                let text_lines =
+                    render_streaming_text_incremental(text, streaming_cache, md_width);
+                for mut line in text_lines {
+                    line.spans.insert(0, margin.clone());
+                    lines.push(line);
+                }
+            }
+            ContentBlock::Text(text) => {
+                // Earlier stable text block — render normally (typically small)
+                if !text.is_empty() {
+                    for mut line in markdown_to_lines(text, md_width) {
+                        line.spans.insert(0, margin.clone());
+                        lines.push(line);
+                    }
+                }
+            }
+            ContentBlock::ToolCall {
+                name,
+                summary,
+                status,
+                ..
+            } => {
+                // Tool calls are cheap to render (no markdown), always re-render for spinner
+                let mut line = render_tool_call(name, summary, status, tick);
+                line.spans.insert(0, margin.clone());
+                lines.push(line);
             }
         }
     }
 
     lines
+}
+
+/// Incrementally render a growing text block using the streaming markdown cache.
+///
+/// Stable prefix (complete paragraphs/code blocks) → cached, never re-parsed.
+/// Unstable suffix (last incomplete block) → re-parsed each frame, line-buffered.
+fn render_streaming_text_incremental(
+    text: &str,
+    cache: &mut Option<StreamingMdCache>,
+    max_width: u16,
+) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let new_boundary = find_stable_boundary(text);
+
+    // Update the streaming cache
+    match cache {
+        Some(ref mut c) if new_boundary > c.boundary => {
+            // Boundary advanced — render the delta (newly completed blocks) and append
+            let delta = &text[c.boundary..new_boundary];
+            if !delta.trim().is_empty() {
+                let delta_lines = markdown_to_lines(delta, max_width);
+                c.prefix_lines.extend(delta_lines);
+            }
+            c.boundary = new_boundary;
+        }
+        Some(ref c) if new_boundary == c.boundary => {
+            // Boundary unchanged — reuse cached prefix as-is
+        }
+        _ => {
+            // No cache, or boundary moved backward (shouldn't happen) — build from scratch
+            let prefix_lines = if new_boundary > 0 {
+                let prefix = &text[..new_boundary];
+                markdown_to_lines(prefix, max_width)
+            } else {
+                Vec::new()
+            };
+            *cache = Some(StreamingMdCache {
+                boundary: new_boundary,
+                prefix_lines,
+            });
+        }
+    }
+
+    // Assemble: cached prefix + freshly-parsed unstable suffix
+    let prefix_lines = &cache.as_ref().unwrap().prefix_lines;
+    let suffix = &text[new_boundary..];
+
+    let mut lines = Vec::with_capacity(prefix_lines.len() + 20);
+    lines.extend(prefix_lines.iter().cloned());
+
+    // Line-buffering: only show text up to the last newline in the suffix
+    if !suffix.is_empty() {
+        let visible = if let Some(nl) = suffix.rfind('\n') {
+            &suffix[..nl + 1]
+        } else {
+            "" // no complete line yet in the suffix
+        };
+        if !visible.is_empty() {
+            lines.extend(markdown_to_lines(visible, max_width));
+        }
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn render_welcome(model_name: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Strands",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " CLI",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Model: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                model_name.to_string(),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Type a message and press Enter to start.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  /help for commands \u{2502} /clear to reset \u{2502} /exit to quit",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+/// Count the number of visual (wrapped) lines for a set of logical lines at a given width.
+/// Paragraph with `Wrap { trim: false }` wraps lines at this width. We must use the
+/// wrapped count for scroll math — using logical count causes content to appear stuck
+/// behind the input on narrow terminals (mobile).
+fn count_wrapped_lines(lines: &[Line], wrap_width: u16) -> u16 {
+    if wrap_width == 0 {
+        return lines.len() as u16;
+    }
+    let w = wrap_width as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            if line_width <= w {
+                1u16
+            } else {
+                ((line_width + w - 1) / w) as u16
+            }
+        })
+        .sum()
+}
+
+/// Convert a ratatui Line to plain text for selection extraction.
+fn line_to_plain_text(line: &Line<'_>) -> String {
+    let mut s = String::new();
+    for span in line.spans.iter() {
+        s.push_str(span.content.as_ref());
+    }
+    s
+}
+
+/// Render the selection highlight as an overlay on the messages area.
+fn render_selection_highlight(state: &AppState, frame: &mut Frame, area: Rect, _y_scroll: u16) {
+    let sel = &state.selection;
+    if sel.anchor == sel.end && !sel.active {
+        return;
+    }
+
+    let ((sr, sc), (er, ec)) = sel.ordered();
+
+    for row in sr..=er {
+        if row < area.y || row >= area.y + area.height {
+            continue;
+        }
+
+        let col_start = if row == sr { sc } else { area.x };
+        let col_end = if row == er {
+            (ec + 1).min(area.x + area.width)
+        } else {
+            area.x + area.width
+        };
+
+        if col_start >= col_end {
+            continue;
+        }
+
+        let buf = frame.buffer_mut();
+        for col in col_start..col_end {
+            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(col, row)) {
+                let fg = cell.fg;
+                let bg = cell.bg;
+                cell.set_fg(if bg == Color::Reset { Color::Black } else { bg });
+                cell.set_bg(if fg == Color::Reset { Color::White } else { fg });
+            }
+        }
+    }
 }

@@ -249,3 +249,53 @@ fn try_highlight(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
 fn syntect_color_to_ratatui(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
+
+/// Find the byte offset of the last stable block boundary in markdown text.
+/// A boundary is a `\n\n` (blank line) that is NOT inside a code fence.
+/// Everything before this offset consists of complete markdown blocks that
+/// will not be affected by text appended after the offset.
+///
+/// Used by the incremental streaming renderer to avoid re-parsing the entire
+/// text on every frame — only the unstable suffix after the boundary is re-parsed.
+pub fn find_stable_boundary(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut fence_count = 0usize;
+    let mut boundary = 0usize;
+    let mut i = 0;
+
+    while i < len {
+        // Check for code fence at start of line
+        if i == 0 || bytes[i - 1] == b'\n' {
+            let trimmed_start = skip_leading_spaces(bytes, i);
+            if trimmed_start + 2 < len
+                && bytes[trimmed_start] == b'`'
+                && bytes[trimmed_start + 1] == b'`'
+                && bytes[trimmed_start + 2] == b'`'
+            {
+                fence_count += 1;
+            }
+        }
+
+        // Check for \n\n (block boundary) outside code fences
+        if bytes[i] == b'\n'
+            && i + 1 < len
+            && bytes[i + 1] == b'\n'
+            && fence_count % 2 == 0
+        {
+            boundary = i + 2; // after the \n\n
+        }
+
+        i += 1;
+    }
+
+    boundary
+}
+
+fn skip_leading_spaces(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    i
+}

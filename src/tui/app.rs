@@ -205,12 +205,56 @@ pub struct PermissionRequest {
     pub decision: Option<bool>,
 }
 
-/// Cached rendered lines to avoid re-rendering markdown every frame.
+/// Per-message render cache entry. Stores pre-rendered lines for a single message.
+/// Valid as long as the fingerprint (block_count, text_len, width) matches and
+/// the message has no running tool calls (which have animated spinners).
 #[derive(Clone)]
-pub struct CachedRender {
+pub struct MessageCacheEntry {
     pub lines: Vec<ratatui::text::Line<'static>>,
-    pub message_gen: usize,
-    pub terminal_width: u16,
+    pub block_count: usize,
+    pub text_len: usize,
+    pub width: u16,
+}
+
+impl MessageCacheEntry {
+    pub fn new(lines: Vec<ratatui::text::Line<'static>>, msg: &ChatMessage, width: u16) -> Self {
+        Self {
+            lines,
+            block_count: msg.blocks.len(),
+            text_len: msg_text_len(msg),
+            width,
+        }
+    }
+
+    pub fn is_valid(&self, msg: &ChatMessage, width: u16) -> bool {
+        self.width == width
+            && self.block_count == msg.blocks.len()
+            && self.text_len == msg_text_len(msg)
+            && !msg_has_running_tool(msg)
+    }
+}
+
+fn msg_text_len(msg: &ChatMessage) -> usize {
+    msg.blocks.iter().map(|b| match b {
+        ContentBlock::Text(t) => t.len(),
+        _ => 0,
+    }).sum()
+}
+
+fn msg_has_running_tool(msg: &ChatMessage) -> bool {
+    msg.blocks.iter().any(|b| matches!(b, ContentBlock::ToolCall { status: ToolCallStatus::Running, .. }))
+}
+
+/// Incremental markdown cache for the streaming message's last text block.
+/// Tracks a "stable prefix boundary" — only the unstable suffix after the
+/// last complete markdown block is re-parsed each frame. Mirrors Claude Code's
+/// `StreamingMarkdown` component with `stablePrefixRef`.
+#[derive(Clone)]
+pub struct StreamingMdCache {
+    /// Byte offset in the text where the stable prefix ends.
+    pub boundary: usize,
+    /// Rendered lines for text[..boundary].
+    pub prefix_lines: Vec<ratatui::text::Line<'static>>,
 }
 
 pub struct AppState {
@@ -254,10 +298,11 @@ pub struct AppState {
     pub unseen_message_count: usize,
     /// Pending permission request overlay.
     pub permission_request: Option<PermissionRequest>,
-    /// Cached rendered lines for virtual scroll optimization.
-    pub cached_render: Option<CachedRender>,
-    /// Generation counter — bumped on every message mutation.
-    pub message_gen: usize,
+    /// Per-message render cache. Parallel to `messages` — each entry caches the
+    /// rendered lines for the corresponding message, validated by fingerprint.
+    pub message_cache: Vec<Option<MessageCacheEntry>>,
+    /// Incremental markdown cache for the streaming message's last text block.
+    pub streaming_md_cache: Option<StreamingMdCache>,
     /// Whether running in fullscreen (alt-screen) mode.
     #[allow(dead_code)]
     pub fullscreen: bool,
@@ -304,8 +349,8 @@ impl AppState {
             unseen_from_line: None,
             unseen_message_count: 0,
             permission_request: None,
-            cached_render: None,
-            message_gen: 0,
+            message_cache: Vec::new(),
+            streaming_md_cache: None,
             fullscreen,
             typeahead: None,
             keybindings,
@@ -313,9 +358,10 @@ impl AppState {
         }
     }
 
-    /// Bump the message generation counter and invalidate render cache.
-    pub fn invalidate_cache(&mut self) {
-        self.message_gen = self.message_gen.wrapping_add(1);
+    /// Clear all render caches (used on /clear).
+    pub fn clear_render_caches(&mut self) {
+        self.message_cache.clear();
+        self.streaming_md_cache = None;
     }
 }
 
@@ -385,6 +431,7 @@ impl TuiApp {
                 }
                 DispatchResult::Local(CommandResult::Clear) => {
                     self.state.messages.clear();
+                    self.state.clear_render_caches();
                     self.agent.clear_history();
                     self.reset_input();
                     return;
@@ -394,7 +441,7 @@ impl TuiApp {
                     let mut msg = ChatMessage::assistant_empty();
                     msg.append_text(&text);
                     self.state.messages.push(msg);
-                    self.state.invalidate_cache();
+
                     self.state.auto_scroll = true;
                     self.state.scroll_offset = 0;
                     self.reset_input();
@@ -420,6 +467,7 @@ impl TuiApp {
                     self.state.messages.push(ChatMessage::user(trimmed.to_string()));
                     self.state.messages.push(ChatMessage::assistant_empty());
                     self.state.agent_status = AgentStatus::Streaming;
+                    self.state.streaming_md_cache = None;
                     self.state.auto_scroll = true;
                     self.state.scroll_offset = 0;
                     self.state.turn_count += 1;
@@ -437,7 +485,7 @@ impl TuiApp {
                     let mut msg = ChatMessage::assistant_empty();
                     msg.append_text(&format!("Unknown command: /{}. Type /help for available commands.", name));
                     self.state.messages.push(msg);
-                    self.state.invalidate_cache();
+
                     self.state.auto_scroll = true;
                     self.state.scroll_offset = 0;
                     self.reset_input();
@@ -464,6 +512,7 @@ impl TuiApp {
         self.state.messages.push(ChatMessage::user(prompt.clone()));
         self.state.messages.push(ChatMessage::assistant_empty());
         self.state.agent_status = AgentStatus::Streaming;
+        self.state.streaming_md_cache = None; // reset for new streaming session
         self.state.auto_scroll = true;
         self.state.scroll_offset = 0;
 
@@ -531,6 +580,7 @@ impl TuiApp {
                     a.cancel();
                 }
                 self.state.messages.clear();
+                self.state.clear_render_caches();
                 self.agent.clear_history();
                 self.state.agent_status = AgentStatus::Idle;
                 self.state.cancel_agent = None;
@@ -541,7 +591,6 @@ impl TuiApp {
                 let mut msg = ChatMessage::assistant_empty();
                 msg.append_text(&text);
                 self.state.messages.push(msg);
-                self.state.invalidate_cache();
                 self.state.auto_scroll = true;
                 self.state.scroll_offset = 0;
                 self.reset_input();
@@ -783,7 +832,7 @@ impl TuiApp {
             Event::AgentTextDelta(text) => {
                 if let Some(msg) = last_msg {
                     msg.append_text(&text);
-                    self.state.invalidate_cache();
+
                     // Track unseen messages when user scrolled away
                     if !self.state.auto_scroll {
                         self.state.unseen_message_count = self.state.unseen_message_count.saturating_add(0);
@@ -796,7 +845,7 @@ impl TuiApp {
             Event::AgentToolStart { name } => {
                 if let Some(msg) = last_msg {
                     msg.add_tool_call(name, String::new(), ToolCallStatus::Running);
-                    self.state.invalidate_cache();
+
                 }
             }
             Event::AgentToolCall { name, input } => {
@@ -811,7 +860,7 @@ impl TuiApp {
                             break;
                         }
                     }
-                    self.state.invalidate_cache();
+
                 }
             }
             Event::AgentToolResult { status, content } => {
@@ -833,14 +882,14 @@ impl TuiApp {
                         }
                     }
                     msg.set_last_tool_status(new_status);
-                    self.state.invalidate_cache();
+
                 }
             }
             Event::AgentDone => {
                 self.state.agent_status = AgentStatus::Idle;
                 self.state.cancel_agent = None;
                 self.agent.reset_cancel();
-                self.state.invalidate_cache();
+                self.state.streaming_md_cache = None;
                 // Bump unseen count for completed turn
                 if !self.state.auto_scroll && self.state.unseen_from_line.is_some() {
                     self.state.unseen_message_count = self.state.unseen_message_count.saturating_add(1);
@@ -850,7 +899,7 @@ impl TuiApp {
                 self.state.agent_status = AgentStatus::Error(e.clone());
                 if let Some(msg) = last_msg {
                     msg.append_text(&format!("\n[Error: {}]", e));
-                    self.state.invalidate_cache();
+
                 }
             }
             _ => {}
