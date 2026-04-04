@@ -343,6 +343,9 @@ pub struct AppState {
     pub token_counts: Option<(u64, u64)>,
     /// Whether the current stream is a /compact — on completion, replace history.
     pub pending_compact: bool,
+    /// Pending system-reminder to inject into the next user prompt.
+    /// Set when entering plan mode; consumed (taken) on the next agent call.
+    pub pending_system_reminder: Option<String>,
 }
 
 /// Permission modes matching Claude Code's Shift+Tab cycle.
@@ -451,6 +454,7 @@ impl AppState {
             context_critical: false,
             token_counts: None,
             pending_compact: false,
+            pending_system_reminder: None,
         }
     }
 
@@ -628,7 +632,7 @@ impl TuiApp {
         self.state.history_stash.clear();
         self.state.turn_count += 1;
 
-        // Add user message
+        // Add user message (shown in UI as-is)
         self.state.messages.push(ChatMessage::user(prompt.clone()));
         self.state.messages.push(ChatMessage::assistant_empty());
         self.state.agent_status = AgentStatus::Streaming;
@@ -638,6 +642,15 @@ impl TuiApp {
 
         self.reset_input();
 
+        // Prepend any pending system-reminder (e.g. plan mode instructions) to the
+        // agent prompt. The user sees their original message in the UI, but the
+        // agent receives the system-reminder context ahead of the user's text.
+        let agent_prompt = if let Some(reminder) = self.state.pending_system_reminder.take() {
+            format!("{}\n\n{}", reminder, prompt)
+        } else {
+            prompt
+        };
+
         // Reset cancel signal and store agent clone for cancellation
         self.agent.reset_cancel();
         self.state.cancel_agent = Some(self.agent.clone());
@@ -645,7 +658,7 @@ impl TuiApp {
         // Spawn agent streaming task
         let agent = self.agent.clone();
         tokio::spawn(async move {
-            Self::run_agent_stream(agent, &prompt, event_tx).await;
+            Self::run_agent_stream(agent, &agent_prompt, event_tx).await;
         });
     }
 
@@ -740,6 +753,10 @@ impl TuiApp {
                     self.state.messages.push(msg);
                     return;
                 }
+                // Store system-reminder for injection into next agent call
+                let plan_file = strands_tools::utility::plan_state::get_plan_file_path(None);
+                let reminder = strands_tools::utility::plan_state::build_plan_mode_system_reminder(&plan_file);
+                self.state.pending_system_reminder = Some(reminder);
                 (PermissionMode::Plan, None)
             }
             "default" => (PermissionMode::Default, Some(strands_tools::utility::plan_state::PermissionMode::Default)),

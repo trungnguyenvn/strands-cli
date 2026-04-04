@@ -30,6 +30,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
     let stdin = io::stdin();
     let mut turn_count: usize = 0;
     let mut message_count: usize = 0;
+    let mut pending_system_reminder: Option<String> = None;
 
     loop {
         print!("{} ", ">".cyan().bold());
@@ -101,11 +102,18 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                     continue;
                 }
                 DispatchResult::Local(CommandResult::ModeSwitch(mode_name)) => {
-                    use strands_tools::utility::mode_skills;
+                    use strands_tools::utility::{mode_skills, plan_state};
                     match mode_skills::handle_mode_skill(&mode_name, None) {
                         Some(Ok(result)) => {
                             if let Some(msg) = result.content {
                                 println!("{}", msg.green());
+                            }
+                            // If entering plan mode, prepare system-reminder for next prompt
+                            if mode_name == "plan" && plan_state::is_in_plan_mode() {
+                                let plan_file = plan_state::get_plan_file_path(None);
+                                pending_system_reminder = Some(
+                                    plan_state::build_plan_mode_system_reminder(&plan_file)
+                                );
                             }
                         }
                         Some(Err(e)) => eprintln!("{} {}", "error:".red().bold(), e),
@@ -164,7 +172,15 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
 
         turn_count += 1;
         message_count += 2;
-        if let Err(e) = stream_turn(agent, input).await {
+
+        // Prepend any pending system-reminder (e.g. plan mode instructions)
+        let agent_prompt = if let Some(reminder) = pending_system_reminder.take() {
+            format!("{}\n\n{}", reminder, input)
+        } else {
+            input.to_string()
+        };
+
+        if let Err(e) = stream_turn(agent, &agent_prompt).await {
             eprintln!("\n{} {}", "error:".red().bold(), e);
         }
         println!();
