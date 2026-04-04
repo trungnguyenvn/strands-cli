@@ -92,9 +92,19 @@ async fn main() -> Result<()> {
     let git_ctx = context::get_git_status(&cwd);
     let user_ctx = context::get_user_context(&cwd);
 
-    // Load MCP servers — async; clients must stay alive for session duration
-    let mcp_session = mcp::load_mcp_servers(&cwd).await;
-    tools.extend(mcp_session.tools);
+    // Load MCP servers for non-TUI modes (TUI loads them in background after UI appears)
+    let mut _mcp_hold: Option<(Vec<strands::tools::mcp::MCPClient>, Vec<strands::tools::mcp::MCPHttpClient>)> = None;
+    let (mcp_server_names, mcp_servers_for_repl) = if cli.no_tui || cli.oneshot.is_some() {
+        let session = mcp::load_mcp_servers(&cwd, false).await;
+        let names = session.server_names;
+        let servers = session.servers;
+        tools.extend(session.tools);
+        // Keep clients alive until end of main (Drop kills subprocesses)
+        _mcp_hold = Some((session.stdio_clients, session.http_clients));
+        (names, servers)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // Load skills from .strands/skills/ and .claude/skills/
     let (skill_infos, skill_cmd_infos) = load_skills(&cwd, &mut tools);
@@ -115,7 +125,7 @@ async fn main() -> Result<()> {
         date: &date,
         has_user_context: user_ctx.is_some(),
         skills: &skill_infos,
-        mcp_server_names: &mcp_session.server_names,
+        mcp_server_names: &mcp_server_names,
     };
     let source = match cli.system.clone() {
         Some(s) => prompt::PromptSource::Override(s),
@@ -150,9 +160,9 @@ async fn main() -> Result<()> {
     if let Some(prompt) = &cli.oneshot {
         repl::run_single_turn(&agent, prompt).await?;
     } else if cli.no_tui {
-        repl::run_repl(&agent, command_registry).await?;
+        repl::run_repl(&agent, command_registry, mcp_servers_for_repl).await?;
     } else {
-        tui::run(agent, model_name, command_registry).await?;
+        tui::run(agent, model_name, command_registry, cwd).await?;
     }
 
     Ok(())
@@ -186,13 +196,13 @@ async fn build_model(cli: &Cli) -> Result<Arc<dyn strands::types::models::Model>
         "bedrock" => {
             use strands::models::bedrock::{BedrockConfig, BedrockModel};
 
+            let model_id = cli.model.clone()
+                .unwrap_or_else(|| "us.anthropic.claude-sonnet-4-6".to_string());
             let mut config = BedrockConfig::default();
-            if let Some(ref model_id) = cli.model {
-                config.model_id = model_id.clone();
-            }
+            config.model_id = model_id;
             config.max_tokens = Some(16384);
 
-            let model = BedrockModel::new(None, None, None, config).await?;
+            let model = BedrockModel::new(None, None, Some("us-east-1".to_string()), config).await?;
 
             Ok(Arc::new(model))
         }
@@ -303,6 +313,13 @@ pub async fn build_model_by_id(model_id: &str) -> Result<Arc<dyn strands::types:
         return build_mistral_model(model_id).await;
     }
 
+    // Default: for Claude models, prefer Anthropic direct API if a key is
+    // available; otherwise fall back to Bedrock (the user likely started with
+    // --provider bedrock and AWS credentials).
+    if model_id.starts_with("claude-") && std::env::var("ANTHROPIC_API_KEY").is_err() {
+        return build_bedrock_model(model_id).await;
+    }
+
     // Default: Anthropic direct API
     build_anthropic_model(model_id).await
 }
@@ -324,7 +341,7 @@ async fn build_bedrock_model(model_id: &str) -> Result<Arc<dyn strands::types::m
     let mut config = BedrockConfig::default();
     config.model_id = model_id.to_string();
     config.max_tokens = Some(16384);
-    let model = BedrockModel::new(None, None, None, config).await?;
+    let model = BedrockModel::new(None, None, Some("us-east-1".to_string()), config).await?;
     Ok(Arc::new(model))
 }
 

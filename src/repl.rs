@@ -13,7 +13,7 @@ use crate::commands::{
     self, CommandContext, CommandRegistry, CommandResult, DispatchResult,
 };
 
-pub async fn run_repl(agent: &Agent, registry: CommandRegistry) -> strands::Result<()> {
+pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec<crate::mcp::McpServerInfo>) -> strands::Result<()> {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".into());
@@ -51,6 +51,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry) -> strands::Resu
                 turn_count,
                 message_count,
                 all_commands: registry.command_infos(),
+                mcp_servers: mcp_servers.clone(),
             };
             match commands::dispatch(input, &registry, &ctx) {
                 DispatchResult::Local(CommandResult::Quit) => break,
@@ -65,6 +66,40 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry) -> strands::Resu
                     continue;
                 }
                 DispatchResult::Local(CommandResult::Skip) => continue,
+                DispatchResult::Local(CommandResult::ModelPicker { current_model, items }) => {
+                    // Plain REPL fallback: show numbered list, let user pick
+                    println!("Current model: {}\n", current_model);
+                    for (i, item) in items.iter().enumerate() {
+                        let marker = if item.model_id == current_model || item.alias == current_model {
+                            "✓"
+                        } else {
+                            " "
+                        };
+                        println!("  {} {:2}) {:<18} {}", marker, i + 1, item.alias, item.label);
+                    }
+                    print!("\nSelect (1-{}) or Enter to cancel: ", items.len());
+                    io::stdout().flush().unwrap();
+                    let mut choice = String::new();
+                    if stdin.read_line(&mut choice).unwrap() == 0 {
+                        break;
+                    }
+                    if let Ok(n) = choice.trim().parse::<usize>() {
+                        if n >= 1 && n <= items.len() {
+                            let model_id = &items[n - 1].model_id;
+                            println!("Switching model to {}...", model_id);
+                            match crate::build_model_by_id(model_id).await {
+                                Ok(new_model) => {
+                                    agent.swap_model(new_model);
+                                    println!("{}", format!("Model switched to {}", model_id).green());
+                                }
+                                Err(e) => {
+                                    eprintln!("{} {}", "error:".red().bold(), e);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
                     println!("Switching model to {}...", model_id);
                     match crate::build_model_by_id(&model_id).await {

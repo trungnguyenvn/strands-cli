@@ -9,6 +9,9 @@ pub mod widgets;
 #[cfg(test)]
 mod tui_tests;
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use crossterm::event::{KeyCode, KeyModifiers};
 use strands::Agent;
 
@@ -18,7 +21,7 @@ use self::terminal::Tui;
 use self::widgets::input_bar::{self, InputAction};
 
 /// Run the fullscreen TUI.
-pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry) -> strands::Result<()> {
+pub async fn run(agent: Agent, model_name: String, command_registry: crate::commands::CommandRegistry, cwd: PathBuf) -> strands::Result<()> {
     // Install panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -38,6 +41,19 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
     let mut event_rx = tui.event_rx.take().unwrap();
     let event_tx = tui.event_tx.clone();
 
+    // Load MCP servers in background — TUI is already visible
+    let mcp_slot: Arc<Mutex<Option<crate::mcp::McpSession>>> = Arc::new(Mutex::new(None));
+    {
+        let slot = mcp_slot.clone();
+        let tx = event_tx.clone();
+        let cwd = cwd.clone();
+        tokio::spawn(async move {
+            let session = crate::mcp::load_mcp_servers(&cwd, true).await;
+            *slot.lock().unwrap() = Some(session);
+            let _ = tx.send(Event::McpLoaded);
+        });
+    }
+
     loop {
         let Some(event) = event_rx.recv().await else {
             break;
@@ -51,6 +67,12 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
             }
             Event::Tick => {
                 app.state.tick_count = app.state.tick_count.wrapping_add(1);
+                // Expire MCP warning after timeout
+                if let app::McpStatus::Warning { expire_tick, .. } = app.state.mcp_status {
+                    if app.state.tick_count >= expire_tick {
+                        app.state.mcp_status = app::McpStatus::None;
+                    }
+                }
             }
             Event::Key(key) => {
                 handle_key(&mut app, key, event_tx.clone());
@@ -73,6 +95,12 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
             Event::Mouse(mouse_event) => {
                 handle_mouse(&mut app, mouse_event);
             }
+            // MCP servers finished loading in background
+            Event::McpLoaded => {
+                if let Some(session) = mcp_slot.lock().unwrap().take() {
+                    app.apply_mcp_session(session);
+                }
+            }
             // Agent events
             Event::AgentTextDelta(_)
             | Event::AgentToolStart { .. }
@@ -93,6 +121,7 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
     tui.exit().map_err(|e| strands::Error::Configuration(e.to_string()))?;
     Ok(())
 }
+
 
 fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
     use crossterm::event::MouseEventKind;
@@ -223,10 +252,15 @@ fn handle_key(
                 match input_bar::handle_input_key(&mut app.state, key) {
                     InputAction::Submit => {
                         if has_suggestions && app.state.selected_suggestion >= 0 {
-                            // Enter with suggestions visible: accept and submit if no args needed
-                            // (mirrors Claude Code's handleEnter → applyCommandSuggestion with shouldExecute=true)
-                            app.accept_suggestion();
-                            app.submit(event_tx);
+                            // If a model suggestion is selected, switch model directly
+                            if let Some(model_id) = app.selected_model_id() {
+                                app.reset_input();
+                                app.switch_model(model_id, event_tx.clone());
+                            } else {
+                                // Enter with suggestions visible: accept and submit
+                                app.accept_suggestion();
+                                app.submit(event_tx);
+                            }
                         } else if is_idle {
                             app.submit(event_tx);
                         } else if is_streaming {

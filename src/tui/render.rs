@@ -37,4 +37,5 @@ pub fn view(frame: &mut Frame, state: &mut AppState) {
     }
     input_bar::render_input(state, frame, chunks[2]);
     status_bar::render_status_bar(state, frame, chunks[3]);
+
 }

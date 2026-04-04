@@ -1,0 +1,85 @@
+{
+  "mcpServers": {
+    "awslabs.aws-diagram-mcp-server": {
+      "args": [
+        "awslabs.aws-diagram-mcp-server@latest"
+      ],
+      "command": "uvx",
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    },
+    "awslabs.aws-pricing-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "awslabs.aws-pricing-mcp-server@latest"
+      ],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "aws-knowledge-mcp-server": {
+      "url": "https://knowledge-mcp.global.api.aws",
+      "type": "http",
+      "disabled": false
+    },
+    "awslabs.aws-api-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "awslabs.aws-api-mcp-server@latest"
+      ],
+      "env": {
+        "AWS_REGION": "us-east-1",
+        "AWS_PROFILE": "lab"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "context7": {
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
+      "autoApprove": [],
+      "command": "npx",
+      "disabled": false,
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    },
+		"playwright": {
+			"command": "npx",
+			"args": [
+				"@playwright/mcp@latest"
+			]
+		},
+    "ddg-search": {
+      "args": [
+        "duckduckgo-mcp-server"
+      ],
+      "autoApprove": [],
+      "command": "uvx",
+      "disabled": true,
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      }
+    },
+    "gpt-oss-browser": {
+      "args": [
+        "mcp-remote",
+        "https://q8epkmgez2.execute-api.ap-southeast-1.amazonaws.com/prod/mcp"
+      ],
+      "command": "npx",
+      "disabled": true
+    },
+    "rust-docs": {
+      "args": [
+        "mcp-remote",
+        "https://njmmm6ikqj.execute-api.ap-southeast-1.amazonaws.com/prod/mcp"
+      ],
+      "command": "npx"
+    }
+  }
+}

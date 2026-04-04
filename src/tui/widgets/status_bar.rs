@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::tui::app::{AgentStatus, AppState};
+use crate::tui::app::{AgentStatus, AppState, McpStatus};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -69,9 +69,24 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         ),
     };
 
+    let mcp_span = match &state.mcp_status {
+        McpStatus::Loading => {
+            let frame_char = SPINNER_FRAMES[state.tick_count % SPINNER_FRAMES.len()];
+            Span::styled(
+                format!(" {} MCP connecting... ", frame_char),
+                Style::default().fg(Color::Yellow),
+            )
+        }
+        McpStatus::Warning { failed, .. } => Span::styled(
+            format!(" MCP: {} failed ", failed),
+            Style::default().fg(Color::Red),
+        ),
+        McpStatus::None => Span::raw(""),
+    };
+
     let sep = Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray));
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {} ", state.model_name),
             Style::default().fg(Color::DarkGray),
@@ -79,6 +94,12 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         sep.clone(),
         spinner,
         status_text,
+    ];
+    if !matches!(state.mcp_status, McpStatus::None) {
+        spans.push(sep.clone());
+        spans.push(mcp_span);
+    }
+    spans.extend([
         sep.clone(),
         turn_info,
         sep.clone(),
@@ -86,6 +107,8 @@ pub fn render_status_bar(state: &AppState, frame: &mut Frame, area: Rect) {
         sep,
         key_hints,
     ]);
+
+    let line = Line::from(spans);
 
     let bar = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
     frame.render_widget(bar, area);

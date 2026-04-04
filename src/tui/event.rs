@@ -25,4 +25,8 @@ pub enum Event {
     AgentToolResult { status: String, content: String },
     AgentDone,
     AgentError(String),
+
+    // MCP lifecycle
+    /// MCP servers finished loading in the background.
+    McpLoaded,
 }

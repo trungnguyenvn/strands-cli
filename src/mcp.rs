@@ -50,11 +50,23 @@ pub struct McpServerEntry {
 
     /// Timeout in seconds (default: 30).
     pub timeout_secs: Option<u64>,
+
+    /// If true, skip this server entirely.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 // ---------------------------------------------------------------------------
 // Session — keeps MCP clients alive for the agent session
 // ---------------------------------------------------------------------------
+
+/// Per-server info for the `/mcp` command.
+#[derive(Clone, Debug)]
+pub struct McpServerInfo {
+    pub name: String,
+    pub transport: &'static str, // "stdio" or "http"
+    pub tool_names: Vec<String>,
+}
 
 /// Holds connected MCP clients and their tools. Must stay alive for the
 /// duration of the agent session — dropping it kills subprocesses / closes
@@ -70,6 +82,10 @@ pub struct McpSession {
     pub tools: Vec<Arc<dyn AgentTool>>,
     /// Names of successfully connected servers (for prompt rendering).
     pub server_names: Vec<String>,
+    /// Per-server details for the `/mcp` command.
+    pub servers: Vec<McpServerInfo>,
+    /// Number of servers that failed to connect.
+    pub failed_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +151,7 @@ fn try_load_mcp_json(path: &Path) -> Option<McpConfigFile> {
 ///
 /// Servers that fail to connect are skipped with a warning — other servers
 /// and native tools continue to work.
-pub async fn load_mcp_servers(cwd: &Path) -> McpSession {
+pub async fn load_mcp_servers(cwd: &Path, quiet: bool) -> McpSession {
     let config = load_mcp_config(cwd);
 
     if config.mcp_servers.is_empty() {
@@ -144,90 +160,128 @@ pub async fn load_mcp_servers(cwd: &Path) -> McpSession {
             http_clients: Vec::new(),
             tools: Vec::new(),
             server_names: Vec::new(),
+            servers: Vec::new(),
+            failed_count: 0,
         };
+    }
+
+    // Connect to all servers in parallel
+    enum ConnectResult {
+        Stdio {
+            name: String,
+            client: MCPClient,
+            tools: Vec<Arc<dyn AgentTool>>,
+            tool_names: Vec<String>,
+        },
+        Http {
+            name: String,
+            client: MCPHttpClient,
+            tools: Vec<Arc<dyn AgentTool>>,
+            tool_names: Vec<String>,
+        },
+        Failed(String, String),   // (name, error)
+        Skipped(String),          // name — no command or url
+    }
+
+    let mut handles = Vec::new();
+
+    for (name, entry) in config.mcp_servers {
+        if entry.disabled {
+            continue;
+        }
+        let timeout = Duration::from_secs(entry.timeout_secs.unwrap_or(30));
+
+        if let Some(url) = entry.url {
+            handles.push(tokio::spawn(async move {
+                let sdk_config = MCPHttpServerConfig {
+                    name: name.clone(),
+                    base_url: url,
+                    headers: entry.headers,
+                    timeout,
+                    env: entry.env,
+                };
+                let client = MCPHttpClient::new(sdk_config);
+                match client.connect().await {
+                    Ok(()) => {
+                        let server_tools = client.list_tools().await;
+                        let tool_names: Vec<String> = server_tools.iter().map(|t| t.tool_name().to_string()).collect();
+                        ConnectResult::Http { name, client, tools: server_tools, tool_names }
+                    }
+                    Err(e) => ConnectResult::Failed(name, e.to_string()),
+                }
+            }));
+        } else if let Some(command) = entry.command {
+            handles.push(tokio::spawn(async move {
+                let mut cmd = vec![command];
+                cmd.extend(entry.args);
+                let sdk_config = MCPServerConfig {
+                    name: name.clone(),
+                    command: cmd,
+                    env: entry.env,
+                    timeout,
+                };
+                let client = MCPClient::new(sdk_config);
+                match client.connect().await {
+                    Ok(()) => {
+                        let server_tools = client.list_tools().await;
+                        let tool_names: Vec<String> = server_tools.iter().map(|t| t.tool_name().to_string()).collect();
+                        ConnectResult::Stdio { name, client, tools: server_tools, tool_names }
+                    }
+                    Err(e) => ConnectResult::Failed(name, e.to_string()),
+                }
+            }));
+        } else {
+            handles.push(tokio::spawn(async move {
+                ConnectResult::Skipped(name)
+            }));
+        }
     }
 
     let mut stdio_clients = Vec::new();
     let mut http_clients = Vec::new();
     let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
     let mut server_names = Vec::new();
+    let mut servers = Vec::new();
+    let mut failed_count: usize = 0;
 
-    for (name, entry) in config.mcp_servers {
-        let timeout = Duration::from_secs(entry.timeout_secs.unwrap_or(30));
-
-        if let Some(url) = entry.url {
-            // HTTP transport
-            let sdk_config = MCPHttpServerConfig {
-                name: name.clone(),
-                base_url: url,
-                headers: entry.headers,
-                timeout,
-                env: entry.env,
-            };
-            let client = MCPHttpClient::new(sdk_config);
-            match client.connect().await {
-                Ok(()) => {
-                    let server_tools = client.list_tools().await;
-                    let n = server_tools.len();
-                    tools.extend(server_tools);
-                    server_names.push(name.clone());
-                    eprintln!(
-                        "{} Connected to HTTP MCP server '{}' ({} tools)",
-                        "mcp:".cyan().bold(),
-                        name,
-                        n
-                    );
-                    http_clients.push(client);
+    for handle in handles {
+        let Ok(result) = handle.await else {
+            failed_count += 1;
+            continue;
+        };
+        match result {
+            ConnectResult::Http { name, client, tools: t, tool_names } => {
+                let n = tool_names.len();
+                if !quiet {
+                    eprintln!("{} Connected to HTTP MCP server '{}' ({} tools)", "mcp:".cyan().bold(), name, n);
                 }
-                Err(e) => {
-                    eprintln!(
-                        "{} Failed to connect to HTTP MCP server '{}': {}",
-                        "mcp warning:".yellow().bold(),
-                        name,
-                        e
-                    );
-                }
+                tools.extend(t);
+                server_names.push(name.clone());
+                servers.push(McpServerInfo { name, transport: "http", tool_names });
+                http_clients.push(client);
             }
-        } else if let Some(command) = entry.command {
-            // Stdio transport
-            let mut cmd = vec![command];
-            cmd.extend(entry.args);
-            let sdk_config = MCPServerConfig {
-                name: name.clone(),
-                command: cmd,
-                env: entry.env,
-                timeout,
-            };
-            let client = MCPClient::new(sdk_config);
-            match client.connect().await {
-                Ok(()) => {
-                    let server_tools = client.list_tools().await;
-                    let n = server_tools.len();
-                    tools.extend(server_tools);
-                    server_names.push(name.clone());
-                    eprintln!(
-                        "{} Connected to MCP server '{}' ({} tools)",
-                        "mcp:".cyan().bold(),
-                        name,
-                        n
-                    );
-                    stdio_clients.push(client);
+            ConnectResult::Stdio { name, client, tools: t, tool_names } => {
+                let n = tool_names.len();
+                if !quiet {
+                    eprintln!("{} Connected to MCP server '{}' ({} tools)", "mcp:".cyan().bold(), name, n);
                 }
-                Err(e) => {
-                    eprintln!(
-                        "{} Failed to connect to MCP server '{}': {}",
-                        "mcp warning:".yellow().bold(),
-                        name,
-                        e
-                    );
-                }
+                tools.extend(t);
+                server_names.push(name.clone());
+                servers.push(McpServerInfo { name, transport: "stdio", tool_names });
+                stdio_clients.push(client);
             }
-        } else {
-            eprintln!(
-                "{} MCP server '{}' has neither 'command' nor 'url' — skipping",
-                "mcp warning:".yellow().bold(),
-                name
-            );
+            ConnectResult::Failed(name, e) => {
+                if !quiet {
+                    eprintln!("{} Failed to connect to MCP server '{}': {}", "mcp warning:".yellow().bold(), name, e);
+                }
+                failed_count += 1;
+            }
+            ConnectResult::Skipped(name) => {
+                if !quiet {
+                    eprintln!("{} MCP server '{}' has neither 'command' nor 'url' — skipping", "mcp warning:".yellow().bold(), name);
+                }
+                failed_count += 1;
+            }
         }
     }
 
@@ -236,5 +290,7 @@ pub async fn load_mcp_servers(cwd: &Path) -> McpSession {
         http_clients,
         tools,
         server_names,
+        servers,
+        failed_count,
     }
 }

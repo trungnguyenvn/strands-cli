@@ -19,8 +19,9 @@ use super::widgets::input_bar;
 
 /// Create a default AppState with a given terminal width/height.
 fn make_state(width: u16, _height: u16) -> AppState {
-    let mut state = AppState::new("test-model".to_string(), crate::commands::builtin_registry());
+    let mut state = AppState::new("test-model".to_string(), crate::commands::builtin_registry(), Vec::new());
     state.terminal_width = width;
+    state.mcp_status = super::app::McpStatus::None;
     state
 }
 
@@ -148,6 +149,7 @@ fn slash_help_renders_command_list() {
         turn_count: state.turn_count,
         message_count: state.messages.len(),
         all_commands: state.command_registry.command_infos(),
+        mcp_servers: Vec::new(),
     };
     match crate::commands::dispatch("/help", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -197,6 +199,7 @@ fn slash_status_renders_session_info() {
         turn_count: 5,
         message_count: 0,
         all_commands: state.command_registry.command_infos(),
+        mcp_servers: Vec::new(),
     };
     match crate::commands::dispatch("/status", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -239,6 +242,7 @@ fn slash_clear_empties_messages() {
         turn_count: 0,
         message_count: 2,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
     match crate::commands::dispatch("/clear", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Clear) => {
@@ -269,6 +273,7 @@ fn slash_exit_sets_quit_flag() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/exit", &state.command_registry, &ctx) {
@@ -294,6 +299,7 @@ fn slash_new_alias_triggers_clear() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/new", &state.command_registry, &ctx) {
@@ -318,6 +324,7 @@ fn slash_question_mark_alias_triggers_help() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/?", &state.command_registry, &ctx) {
@@ -343,6 +350,7 @@ fn slash_compact_returns_prompt() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/compact", &state.command_registry, &ctx) {
@@ -364,6 +372,7 @@ fn slash_compact_with_args_includes_custom_instructions() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/compact keep all file paths", &state.command_registry, &ctx) {
@@ -390,6 +399,7 @@ fn unknown_command_renders_error() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
     match crate::commands::dispatch("/nonexistent", &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Unknown(name) => {
@@ -429,6 +439,7 @@ fn file_path_is_not_a_command() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/var/log/foo", &state.command_registry, &ctx) {
@@ -673,6 +684,7 @@ fn try_immediate_command_status_during_streaming() {
         turn_count: 0,
         message_count: 0,
     all_commands: state.command_registry.command_infos(),
+    mcp_servers: Vec::new(),
     };
     match crate::commands::dispatch(trimmed, &state.command_registry, &ctx) {
         crate::commands::DispatchResult::Local(crate::commands::CommandResult::Text(text)) => {
@@ -734,6 +746,7 @@ fn disabled_command_treated_as_unknown() {
         turn_count: 0,
         message_count: 0,
         all_commands: reg.command_infos(),
+        mcp_servers: Vec::new(),
     };
 
     match crate::commands::dispatch("/secret", &reg, &ctx) {
@@ -759,4 +772,460 @@ fn status_bar_shows_bottom_when_auto_scroll() {
         last.contains("bottom") || last.contains("\u{2193}"),
         "Status bar should show 'bottom' indicator when auto_scroll, got: {last}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E2E: /model command — model picker
+// ---------------------------------------------------------------------------
+
+/// Helper: dispatch /model and return the text output.
+fn dispatch_model(state: &AppState, args: &str) -> crate::commands::DispatchResult {
+    let input = if args.is_empty() { "/model".to_string() } else { format!("/model {}", args) };
+    let ctx = crate::commands::CommandContext {
+        model_name: state.model_name.clone(),
+        turn_count: state.turn_count,
+        message_count: state.messages.len(),
+        all_commands: state.command_registry.command_infos(),
+        mcp_servers: Vec::new(),
+    };
+    crate::commands::dispatch(&input, &state.command_registry, &ctx)
+}
+
+/// Helper: dispatch /model with args, push result into state, render, return buffer.
+fn dispatch_model_and_render(state: &mut AppState, args: &str, w: u16, h: u16) -> Buffer {
+    let input = format!("/model {}", args);
+    let ctx = crate::commands::CommandContext {
+        model_name: state.model_name.clone(),
+        turn_count: state.turn_count,
+        message_count: state.messages.len(),
+        all_commands: state.command_registry.command_infos(),
+        mcp_servers: Vec::new(),
+    };
+    match crate::commands::dispatch(&input, &state.command_registry, &ctx) {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            state.messages.push(ChatMessage::user(input));
+            let mut msg = ChatMessage::assistant_empty();
+            msg.append_text(&format!("Switching to model: {}", id));
+            state.messages.push(msg);
+        }
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::ModelPicker { .. }) => {
+            // Model picker now shows as suggestions instead of a modal
+        }
+        other => panic!("Unexpected dispatch result for /model: {:?}", std::mem::discriminant(&other)),
+    }
+    render_to_buffer(state, w, h)
+}
+
+// -- /model no args: opens interactive picker --
+
+#[test]
+fn model_no_args_returns_picker() {
+    let state = make_state(80, 30);
+    match dispatch_model(&state, "") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::ModelPicker { current_model, items }) => {
+            assert_eq!(current_model, "test-model");
+            assert!(!items.is_empty(), "picker should have items");
+        }
+        _ => panic!("expected ModelPicker"),
+    }
+}
+
+#[test]
+fn model_no_args_picker_has_items() {
+    let state = make_state(80, 30);
+    match dispatch_model(&state, "") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::ModelPicker { items, .. }) => {
+            // Should have items from at least some groups
+            let has_claude = items.iter().any(|i| i.alias == "sonnet");
+            assert!(has_claude || !items.is_empty(), "picker should have models");
+        }
+        _ => panic!("expected ModelPicker"),
+    }
+}
+
+#[test]
+fn model_no_args_renders_without_crash() {
+    let mut state = make_state(100, 40);
+    // Should not panic — model picker is now handled via suggestions, not a modal
+    let _buf = dispatch_model_and_render(&mut state, "", 100, 40);
+}
+
+// -- /model with alias: returns SwitchModel --
+
+#[test]
+fn model_switch_sonnet_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "sonnet") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("sonnet"), "sonnet alias should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_opus_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "opus") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("opus"), "opus alias should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_haiku_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "haiku") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("haiku"), "haiku alias should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_sonnet_4_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "sonnet-4") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("sonnet-4"), "sonnet-4 alias should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_opus_4_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "opus-4") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("opus-4"), "opus-4 alias should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_sonnet_35_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "sonnet-3.5") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("sonnet") || id.contains("3-5"), "sonnet-3.5 should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_haiku_35_alias() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "haiku-3.5") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("haiku") || id.contains("3-5"), "haiku-3.5 should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- Amazon Nova aliases --
+
+#[test]
+fn model_switch_nova_pro() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "nova-pro") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("nova-pro"), "nova-pro should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_nova_lite() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "nova-lite") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("nova-lite"), "nova-lite should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_nova_micro() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "nova-micro") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("nova-micro"), "nova-micro should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_nova_premier() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "nova-premier") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("nova-premier"), "nova-premier should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- Meta Llama aliases --
+
+#[test]
+fn model_switch_llama_4_scout() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "llama-4-scout") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("llama4-scout") || id.contains("llama-4-scout"), "llama-4-scout should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_llama_4_maverick() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "llama-4-maverick") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("llama4-maverick") || id.contains("llama-4-maverick"), "should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_llama_33_70b() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "llama-3.3-70b") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("llama3-3-70b") || id.contains("llama-3.3-70b"), "should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- Mistral alias --
+
+#[test]
+fn model_switch_mistral_large() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "mistral-large") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("mistral"), "mistral-large should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- OpenAI aliases --
+
+#[test]
+fn model_switch_gpt_4o() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "gpt-4o") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("gpt-4o"), "gpt-4o should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_gpt_41() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "gpt-4.1") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("gpt-4.1"), "gpt-4.1 should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_o3() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "o3") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "o3");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_o3_mini() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "o3-mini") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "o3-mini");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- Ollama aliases --
+
+#[test]
+fn model_switch_ollama_llama32() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "ollama-llama3.2") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("llama3.2"), "ollama-llama3.2 should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_ollama_qwen3() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "ollama-qwen3") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("qwen3"), "ollama-qwen3 should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_ollama_deepseek_r1() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "ollama-deepseek-r1") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert!(id.contains("deepseek-r1"), "ollama-deepseek-r1 should resolve, got: {}", id);
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- Full model ID passthrough --
+
+#[test]
+fn model_switch_full_id_passthrough() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "claude-sonnet-4-6-20250514") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "claude-sonnet-4-6-20250514");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_bedrock_full_id() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "global.anthropic.claude-sonnet-4-6-v1") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "global.anthropic.claude-sonnet-4-6-v1");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_explicit_provider_prefix() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "bedrock/amazon.nova-pro-v1:0") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "bedrock/amazon.nova-pro-v1:0");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_ollama_explicit_prefix() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "ollama/mistral:7b") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "ollama/mistral:7b");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+#[test]
+fn model_switch_custom_unknown_id() {
+    let state = make_state(80, 24);
+    match dispatch_model(&state, "my-custom-fine-tuned-model") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+            assert_eq!(id, "my-custom-fine-tuned-model");
+        }
+        _ => panic!("expected SwitchModel"),
+    }
+}
+
+// -- /model renders in TUI for switch --
+
+#[test]
+fn model_switch_renders_in_tui() {
+    let mut state = make_state(100, 30);
+    let buf = dispatch_model_and_render(&mut state, "sonnet", 100, 30);
+    assert!(buffer_contains(&buf, "Switching to model:"), "should show switching message");
+}
+
+// -- /model is immediate (works during streaming) --
+
+#[test]
+fn model_command_is_immediate() {
+    let state = make_state(80, 24);
+    let cmd = state.command_registry.find("model").expect("/model should exist");
+    assert!(cmd.immediate, "/model should be immediate");
+}
+
+// -- /model argument hint renders --
+
+#[test]
+fn model_argument_hint_renders() {
+    let mut state = make_state(80, 24);
+    type_text(&mut state, "/model ");
+    let buf = render_to_buffer(&mut state, 80, 24);
+    assert!(
+        buffer_contains(&buf, "[model-id]"),
+        "Argument hint should render after '/model '"
+    );
+}
+
+// -- All 22 aliases produce SwitchModel (comprehensive sweep) --
+
+#[test]
+fn all_model_aliases_produce_switch_model() {
+    let all_aliases = [
+        "sonnet", "opus", "haiku",
+        "sonnet-4", "opus-4", "sonnet-3.5", "haiku-3.5",
+        "nova-pro", "nova-lite", "nova-micro", "nova-premier",
+        "llama-4-scout", "llama-4-maverick", "llama-3.3-70b",
+        "mistral-large",
+        "gpt-4o", "gpt-4.1", "o3", "o3-mini",
+        "ollama-llama3.2", "ollama-qwen3", "ollama-deepseek-r1",
+    ];
+    let state = make_state(80, 24);
+    for alias in all_aliases {
+        match dispatch_model(&state, alias) {
+            crate::commands::DispatchResult::Local(crate::commands::CommandResult::SwitchModel(id)) => {
+                assert!(!id.is_empty(), "alias '{}' resolved to empty ID", alias);
+            }
+            other => panic!("alias '{}' should produce SwitchModel, got {:?}", alias, std::mem::discriminant(&other)),
+        }
+    }
+}
+
+// -- /model no args: picker always returns items (fallback when no providers) --
+
+#[test]
+fn model_picker_always_has_items() {
+    let state = make_state(80, 30);
+    match dispatch_model(&state, "") {
+        crate::commands::DispatchResult::Local(crate::commands::CommandResult::ModelPicker { items, .. }) => {
+            // Even with no providers detected, fallback shows all models
+            assert!(!items.is_empty(), "picker should always have items");
+        }
+        _ => panic!("expected ModelPicker"),
+    }
 }

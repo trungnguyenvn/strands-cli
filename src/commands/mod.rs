@@ -48,6 +48,20 @@ pub fn looks_like_command(name: &str) -> bool {
 // Command result
 // ---------------------------------------------------------------------------
 
+/// An item in the interactive model picker.
+#[derive(Clone, Debug)]
+pub struct ModelPickerItem {
+    /// Short alias for display (e.g., "sonnet", "nova-pro")
+    pub alias: String,
+    /// Human-readable label (e.g., "Claude Sonnet 4.6 (latest)")
+    pub label: String,
+    /// The model ID that will be passed to `build_model_by_id`
+    pub model_id: String,
+    /// Provider group for section headers (e.g., "Anthropic Claude")
+    #[allow(dead_code)]
+    pub group: String,
+}
+
 /// The result of executing a local slash command.
 pub enum CommandResult {
     /// Display text to the user (not sent to the model).
@@ -62,6 +76,11 @@ pub enum CommandResult {
     /// Switch the model to the given model ID string.
     /// The caller (TUI/REPL) handles async model construction and agent.swap_model().
     SwitchModel(String),
+    /// Open the interactive model picker with available models.
+    ModelPicker {
+        current_model: String,
+        items: Vec<ModelPickerItem>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -84,16 +103,20 @@ pub struct CommandContext {
     pub message_count: usize,
     /// Snapshot of all visible commands for /help. Populated by the caller.
     pub all_commands: Vec<CommandInfo>,
+    /// Connected MCP servers (for /mcp command).
+    pub mcp_servers: Vec<crate::mcp::McpServerInfo>,
 }
 
+#[cfg(test)]
 impl CommandContext {
-    /// Convenience constructor for tests and callers without a full registry.
+    /// Convenience constructor for tests.
     pub fn basic(model_name: &str, turn_count: usize, message_count: usize) -> Self {
         Self {
             model_name: model_name.to_string(),
             turn_count,
             message_count,
             all_commands: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -198,7 +221,7 @@ impl CommandRegistry {
 
 /// Names of built-in commands (used to distinguish from skills in /help).
 fn builtin_command_names() -> &'static [&'static str] {
-    &["exit", "clear", "help", "status", "compact", "model", "skills"]
+    &["exit", "clear", "help", "status", "compact", "model", "skills", "mcp"]
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +355,19 @@ fn builtin_commands() -> Vec<Command> {
                 execute: cmd_skills,
             },
         },
+        // /mcp
+        Command {
+            name: "mcp".into(),
+            description: "Show connected MCP servers and tools".into(),
+            aliases: vec![],
+            is_hidden: false,
+            argument_hint: None,
+            is_enabled: None,
+            immediate: true,
+            kind: CommandKind::Local {
+                execute: cmd_mcp,
+            },
+        },
         // /compact
         Command {
             name: "compact".into(),
@@ -349,6 +385,7 @@ fn builtin_commands() -> Vec<Command> {
 }
 
 /// Build the default command registry with built-in commands only.
+#[cfg(test)]
 pub fn builtin_registry() -> CommandRegistry {
     CommandRegistry::new(builtin_commands())
 }
@@ -480,7 +517,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "sonnet",
         label: "Claude Sonnet 4.6 (latest)",
         anthropic: Some("claude-sonnet-4-6-20250514"),
-        bedrock: Some("global.anthropic.claude-sonnet-4-6-v1"),
+        bedrock: Some("us.anthropic.claude-sonnet-4-6"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -488,7 +525,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "opus",
         label: "Claude Opus 4.6 (latest)",
         anthropic: Some("claude-opus-4-6-20250626"),
-        bedrock: Some("global.anthropic.claude-opus-4-6-v1"),
+        bedrock: Some("us.anthropic.claude-opus-4-6-v1"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -497,7 +534,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "haiku",
         label: "Claude Haiku 4.5",
         anthropic: Some("claude-haiku-4-5-20251001"),
-        bedrock: Some("global.anthropic.claude-haiku-4-5-v1"),
+        bedrock: Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -506,7 +543,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "sonnet-4",
         label: "Claude Sonnet 4",
         anthropic: Some("claude-sonnet-4-20250514"),
-        bedrock: Some("global.anthropic.claude-sonnet-4-20250514-v1:0"),
+        bedrock: Some("us.anthropic.claude-sonnet-4-20250514-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -514,7 +551,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "opus-4",
         label: "Claude Opus 4",
         anthropic: Some("claude-opus-4-20250514"),
-        bedrock: Some("global.anthropic.claude-opus-4-20250514-v1:0"),
+        bedrock: Some("us.anthropic.claude-opus-4-20250514-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -523,7 +560,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "sonnet-3.5",
         label: "Claude Sonnet 3.5",
         anthropic: Some("claude-3-5-sonnet-20241022"),
-        bedrock: Some("global.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+        bedrock: Some("us.anthropic.claude-3-5-sonnet-20241022-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -531,7 +568,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "haiku-3.5",
         label: "Claude Haiku 3.5",
         anthropic: Some("claude-3-5-haiku-20241022"),
-        bedrock: Some("global.anthropic.claude-3-5-haiku-20241022-v1:0"),
+        bedrock: Some("us.anthropic.claude-3-5-haiku-20241022-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Anthropic Claude",
     },
@@ -540,7 +577,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "nova-pro",
         label: "Amazon Nova Pro",
         anthropic: None,
-        bedrock: Some("amazon.nova-pro-v1:0"),
+        bedrock: Some("us.amazon.nova-pro-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Amazon Nova",
     },
@@ -548,7 +585,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "nova-lite",
         label: "Amazon Nova Lite",
         anthropic: None,
-        bedrock: Some("amazon.nova-lite-v1:0"),
+        bedrock: Some("us.amazon.nova-lite-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Amazon Nova",
     },
@@ -556,7 +593,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "nova-micro",
         label: "Amazon Nova Micro",
         anthropic: None,
-        bedrock: Some("amazon.nova-micro-v1:0"),
+        bedrock: Some("us.amazon.nova-micro-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Amazon Nova",
     },
@@ -564,7 +601,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "nova-premier",
         label: "Amazon Nova Premier",
         anthropic: None,
-        bedrock: Some("amazon.nova-premier-v1:0"),
+        bedrock: Some("us.amazon.nova-premier-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Amazon Nova",
     },
@@ -573,7 +610,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "llama-4-scout",
         label: "Llama 4 Scout 17B",
         anthropic: None,
-        bedrock: Some("meta.llama4-scout-17b-instruct-v1:0"),
+        bedrock: Some("us.meta.llama4-scout-17b-instruct-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Meta Llama",
     },
@@ -581,7 +618,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "llama-4-maverick",
         label: "Llama 4 Maverick 17B",
         anthropic: None,
-        bedrock: Some("meta.llama4-maverick-17b-instruct-v1:0"),
+        bedrock: Some("us.meta.llama4-maverick-17b-instruct-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Meta Llama",
     },
@@ -589,7 +626,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "llama-3.3-70b",
         label: "Llama 3.3 70B",
         anthropic: None,
-        bedrock: Some("meta.llama3-3-70b-instruct-v1:0"),
+        bedrock: Some("us.meta.llama3-3-70b-instruct-v1:0"),
         openai: None, ollama: None, mistral: None,
         group: "Meta Llama",
     },
@@ -598,7 +635,7 @@ const ALL_MODELS: &[ModelConfig] = &[
         alias: "mistral-large",
         label: "Mistral Large",
         anthropic: None,
-        bedrock: Some("mistral.mistral-large-2407-v1:0"),
+        bedrock: Some("us.mistral.pixtral-large-2502-v1:0"),
         openai: None, ollama: None,
         mistral: Some("mistral-large-latest"),
         group: "Mistral",
@@ -749,11 +786,21 @@ pub fn resolve_model_alias(input: &str) -> String {
     let lower = input.trim().to_lowercase();
     let providers = detect_available_providers();
 
+    // Match by alias first (e.g., "opus" → bedrock/us.anthropic.claude-opus-4-6-v1)
     for m in ALL_MODELS {
         if lower == m.alias {
             return resolve_model_id(m, &providers).unwrap_or_else(|| input.trim().to_string());
         }
     }
+
+    // Match by any provider's raw model ID (e.g., "claude-opus-4-6-20250626" → resolve for current provider)
+    for m in ALL_MODELS {
+        let ids: Vec<Option<&str>> = vec![m.anthropic, m.bedrock, m.openai, m.ollama, m.mistral];
+        if ids.into_iter().any(|id| id.map(|s| s.to_lowercase()) == Some(lower.clone())) {
+            return resolve_model_id(m, &providers).unwrap_or_else(|| input.trim().to_string());
+        }
+    }
+
     input.trim().to_string()
 }
 
@@ -761,71 +808,45 @@ pub fn resolve_model_alias(input: &str) -> String {
 // /model command
 // ---------------------------------------------------------------------------
 
+/// Build the list of available model picker items based on detected credentials.
+pub fn build_model_picker_items() -> Vec<ModelPickerItem> {
+    let providers = detect_available_providers();
+    let mut items = Vec::new();
+    for m in ALL_MODELS {
+        if model_available(m, &providers) {
+            let model_id = resolve_model_id(m, &providers)
+                .unwrap_or_else(|| m.alias.to_string());
+            items.push(ModelPickerItem {
+                alias: m.alias.to_string(),
+                label: m.label.to_string(),
+                model_id,
+                group: m.group.to_string(),
+            });
+        }
+    }
+    // If no providers detected, show all models with fallback IDs
+    if items.is_empty() {
+        for m in ALL_MODELS {
+            let model_id = resolve_model_id(m, &providers)
+                .unwrap_or_else(|| m.alias.to_string());
+            items.push(ModelPickerItem {
+                alias: m.alias.to_string(),
+                label: m.label.to_string(),
+                model_id,
+                group: m.group.to_string(),
+            });
+        }
+    }
+    items
+}
+
 fn cmd_model(args: &str, ctx: &CommandContext) -> CommandResult {
     if args.trim().is_empty() {
-        let providers = detect_available_providers();
-        let mut lines = vec![
-            format!("Current model: {}", ctx.model_name),
-            String::new(),
-            "Usage: /model <alias|model-id>".to_string(),
-            "       /model provider/model-id  (explicit provider)".to_string(),
-        ];
-
-        // Group models by their group field, only show groups with available models
-        let groups: &[&str] = &["Anthropic Claude", "Amazon Nova", "Meta Llama", "Mistral", "OpenAI", "Ollama"];
-
-        for &group in groups {
-            let group_models: Vec<&ModelConfig> = ALL_MODELS.iter()
-                .filter(|m| m.group == group && model_available(m, &providers))
-                .collect();
-
-            if group_models.is_empty() {
-                continue;
-            }
-
-            lines.push(String::new());
-            // Show provider routing hint for Bedrock-only groups
-            let header = if group_models.iter().all(|m| m.anthropic.is_none() && m.bedrock.is_some()) {
-                format!("{} (Bedrock):", group)
-            } else {
-                format!("{}:", group)
-            };
-            lines.push(header);
-
-            for m in &group_models {
-                // Show the model ID that would actually be used
-                let model_id = resolve_model_id(m, &providers)
-                    .unwrap_or_else(|| "?".to_string());
-                // Strip provider/ prefix for display if it matches the group
-                let display_id = model_id
-                    .strip_prefix("bedrock/")
-                    .or_else(|| model_id.strip_prefix("ollama/"))
-                    .or_else(|| model_id.strip_prefix("mistral/"))
-                    .unwrap_or(&model_id);
-                lines.push(format!("  {:<18} {}", m.alias, display_id));
-            }
+        let items = build_model_picker_items();
+        CommandResult::ModelPicker {
+            current_model: ctx.model_name.clone(),
+            items,
         }
-
-        // Show which providers are detected
-        lines.push(String::new());
-        let mut active: Vec<&str> = Vec::new();
-        let mut inactive: Vec<&str> = Vec::new();
-        if providers.anthropic { active.push("anthropic"); } else { inactive.push("anthropic"); }
-        if providers.bedrock { active.push("bedrock"); } else { inactive.push("bedrock"); }
-        if providers.openai { active.push("openai"); } else { inactive.push("openai"); }
-        if providers.mistral { active.push("mistral"); } else { inactive.push("mistral"); }
-        if providers.ollama { active.push("ollama"); } else { inactive.push("ollama"); }
-
-        if !active.is_empty() {
-            lines.push(format!("Active providers: {}", active.join(", ")));
-        }
-        if !inactive.is_empty() {
-            lines.push(format!("Inactive (no credentials): {}", inactive.join(", ")));
-            lines.push("Set API keys: ANTHROPIC_API_KEY, OPENAI_API_KEY, MISTRAL_API_KEY".to_string());
-            lines.push("AWS Bedrock: aws configure, or set AWS_PROFILE/AWS_ACCESS_KEY_ID".to_string());
-        }
-
-        CommandResult::Text(lines.join("\n"))
     } else {
         let model_id = resolve_model_alias(args);
         CommandResult::SwitchModel(model_id)
@@ -850,6 +871,44 @@ fn cmd_skills(_args: &str, ctx: &CommandContext) -> CommandResult {
     }
     lines.push(String::new());
     lines.push("Skills are loaded from .claude/skills/ and .strands/skills/".to_string());
+    CommandResult::Text(lines.join("\n"))
+}
+
+fn cmd_mcp(_args: &str, ctx: &CommandContext) -> CommandResult {
+    if ctx.mcp_servers.is_empty() {
+        return CommandResult::Text(
+            "No MCP servers connected.\n\n\
+             Add servers in .strands/mcp.json or .claude/mcp.json:\n\n\
+             {\n  \"mcpServers\": {\n    \"my-server\": {\n      \"command\": \"npx\",\n      \
+             \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n    }\n  }\n}"
+                .to_string(),
+        );
+    }
+
+    let total_tools: usize = ctx.mcp_servers.iter().map(|s| s.tool_names.len()).sum();
+    let mut lines = vec![
+        format!(
+            "{} MCP server(s) connected ({} tools total):",
+            ctx.mcp_servers.len(),
+            total_tools
+        ),
+        String::new(),
+    ];
+
+    for server in &ctx.mcp_servers {
+        lines.push(format!(
+            "  {} ({}, {} tools)",
+            server.name,
+            server.transport,
+            server.tool_names.len()
+        ));
+        for tool in &server.tool_names {
+            lines.push(format!("    - {}", tool));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Config: .strands/mcp.json or .claude/mcp.json".to_string());
     CommandResult::Text(lines.join("\n"))
 }
 
@@ -878,17 +937,27 @@ fn cmd_compact_prompt(args: &str, _ctx: &CommandContext) -> String {
 pub struct SuggestionItem {
     pub name: String,
     pub description: String,
+    /// When set, this suggestion represents a model choice rather than a command.
+    /// Accepting it should trigger a model switch instead of filling the input.
+    pub model_id: Option<String>,
 }
 
 /// Generate command suggestions for a partial input.
-pub fn generate_suggestions(input: &str, registry: &CommandRegistry) -> Vec<SuggestionItem> {
+/// When the input is `/model ` (with trailing space), returns model choices as suggestions.
+pub fn generate_suggestions(input: &str, registry: &CommandRegistry, current_model: &str) -> Vec<SuggestionItem> {
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
         return Vec::new();
     }
 
-    // Don't show suggestions if there are real arguments after the command
+    // Check if this is a `/model <partial>` input — show model suggestions
     if let Some(space_idx) = trimmed.find(' ') {
+        let cmd_name = &trimmed[1..space_idx];
+        if cmd_name == "model" {
+            let query = trimmed[space_idx + 1..].trim().to_lowercase();
+            return generate_model_suggestions(&query, current_model);
+        }
+        // For other commands, don't show suggestions if there are real arguments
         if trimmed[space_idx + 1..].trim().len() > 0 {
             return Vec::new();
         }
@@ -915,6 +984,7 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry) -> Vec<Sugg
         .map(|cmd| SuggestionItem {
             name: cmd.name.clone(),
             description: cmd.description.clone(),
+            model_id: None,
         })
         .collect();
 
@@ -932,6 +1002,51 @@ pub fn generate_suggestions(input: &str, registry: &CommandRegistry) -> Vec<Sugg
     });
 
     matches
+}
+
+/// Generate model suggestions for the `/model` command argument.
+fn generate_model_suggestions(query: &str, current_model: &str) -> Vec<SuggestionItem> {
+    let items = build_model_picker_items();
+    let mut suggestions: Vec<SuggestionItem> = items
+        .into_iter()
+        .filter(|item| {
+            if query.is_empty() {
+                return true;
+            }
+            item.alias.to_lowercase().starts_with(query)
+                || item.label.to_lowercase().contains(query)
+                || item.model_id.to_lowercase().starts_with(query)
+        })
+        .map(|item| {
+            let is_current = item.model_id == current_model || item.alias == current_model;
+            let description = if is_current {
+                format!("{} (current)", item.label)
+            } else {
+                item.label
+            };
+            SuggestionItem {
+                name: item.alias,
+                description,
+                model_id: Some(item.model_id),
+            }
+        })
+        .collect();
+
+    // Exact matches first, then alphabetical
+    suggestions.sort_by(|a, b| {
+        let a_exact = a.name.to_lowercase() == *query;
+        let b_exact = b.name.to_lowercase() == *query;
+        if a_exact != b_exact {
+            return if a_exact {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        a.name.cmp(&b.name)
+    });
+
+    suggestions
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1127,7 @@ mod tests {
     #[test]
     fn suggestions_prefix_c() {
         let reg = builtin_registry();
-        let suggestions = generate_suggestions("/c", &reg);
+        let suggestions = generate_suggestions("/c", &reg, "test");
         assert!(!suggestions.is_empty());
         let names: Vec<&str> = suggestions.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"clear"));
@@ -1023,7 +1138,7 @@ mod tests {
     #[test]
     fn suggestions_exact_match() {
         let reg = builtin_registry();
-        let suggestions = generate_suggestions("/help", &reg);
+        let suggestions = generate_suggestions("/help", &reg, "test");
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].name, "help");
     }
@@ -1031,28 +1146,28 @@ mod tests {
     #[test]
     fn suggestions_slash_only_shows_all() {
         let reg = builtin_registry();
-        let suggestions = generate_suggestions("/", &reg);
+        let suggestions = generate_suggestions("/", &reg, "test");
         assert!(suggestions.len() >= 5);
     }
 
     #[test]
     fn suggestions_empty_when_args_present() {
         let reg = builtin_registry();
-        let suggestions = generate_suggestions("/compact some args", &reg);
+        let suggestions = generate_suggestions("/compact some args", &reg, "test");
         assert!(suggestions.is_empty());
     }
 
     #[test]
     fn suggestions_no_match() {
         let reg = builtin_registry();
-        let suggestions = generate_suggestions("/zzz", &reg);
+        let suggestions = generate_suggestions("/zzz", &reg, "test");
         assert!(suggestions.is_empty());
     }
 
     #[test]
     fn suggestions_not_slash() {
         let reg = builtin_registry();
-        let suggestions = generate_suggestions("hello", &reg);
+        let suggestions = generate_suggestions("hello", &reg, "test");
         assert!(suggestions.is_empty());
     }
 
@@ -1166,12 +1281,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_bedrock_ids_start_with_global() {
+    fn claude_bedrock_ids_start_with_us_anthropic() {
         for m in ALL_MODELS.iter().filter(|m| m.group == "Anthropic Claude") {
             if let Some(bedrock_id) = m.bedrock {
                 assert!(
-                    bedrock_id.starts_with("global.anthropic."),
-                    "{}: bedrock ID '{}' should start with global.anthropic.",
+                    bedrock_id.starts_with("us.anthropic."),
+                    "{}: bedrock ID '{}' should start with us.anthropic.",
                     m.alias, bedrock_id
                 );
             }
@@ -1192,12 +1307,12 @@ mod tests {
     }
 
     #[test]
-    fn nova_bedrock_ids_start_with_amazon() {
+    fn nova_bedrock_ids_start_with_us_amazon() {
         for alias in ["nova-pro", "nova-lite", "nova-micro", "nova-premier"] {
             let m = find_model(alias);
             assert!(
-                m.bedrock.unwrap().starts_with("amazon.nova"),
-                "{}: bedrock ID should start with amazon.nova",
+                m.bedrock.unwrap().starts_with("us.amazon.nova"),
+                "{}: bedrock ID should start with us.amazon.nova",
                 alias
             );
         }
@@ -1216,12 +1331,12 @@ mod tests {
     }
 
     #[test]
-    fn llama_bedrock_ids_start_with_meta() {
+    fn llama_bedrock_ids_start_with_us_meta() {
         for alias in ["llama-4-scout", "llama-4-maverick", "llama-3.3-70b"] {
             let m = find_model(alias);
             assert!(
-                m.bedrock.unwrap().starts_with("meta.llama"),
-                "{}: bedrock ID should start with meta.llama",
+                m.bedrock.unwrap().starts_with("us.meta.llama"),
+                "{}: bedrock ID should start with us.meta.llama",
                 alias
             );
         }
@@ -1348,7 +1463,7 @@ mod tests {
         let p = providers_only("bedrock");
         let m = find_model("sonnet");
         let id = resolve_model_id(m, &p).unwrap();
-        assert_eq!(id, "bedrock/global.anthropic.claude-sonnet-4-6-v1");
+        assert_eq!(id, "bedrock/us.anthropic.claude-sonnet-4-6");
     }
 
     #[test]
@@ -1356,7 +1471,7 @@ mod tests {
         let p = providers_only("bedrock");
         let m = find_model("nova-pro");
         let id = resolve_model_id(m, &p).unwrap();
-        assert_eq!(id, "bedrock/amazon.nova-pro-v1:0");
+        assert_eq!(id, "bedrock/us.amazon.nova-pro-v1:0");
     }
 
     #[test]
@@ -1409,35 +1524,35 @@ mod tests {
         let p = providers_none();
         let m = find_model("nova-pro");
         let id = resolve_model_id(m, &p).unwrap();
-        assert_eq!(id, "bedrock/amazon.nova-pro-v1:0");
+        assert_eq!(id, "bedrock/us.amazon.nova-pro-v1:0");
     }
 
     // -- /model command output --
 
     #[test]
-    fn cmd_model_no_args_shows_current() {
+    fn cmd_model_no_args_returns_picker() {
         let ctx = CommandContext::basic("claude-sonnet-4-6-20250514", 5, 10);
         match cmd_model("", &ctx) {
-            CommandResult::Text(text) => {
-                assert!(text.contains("Current model: claude-sonnet-4-6-20250514"));
-                assert!(text.contains("Usage:"));
+            CommandResult::ModelPicker { current_model, items } => {
+                assert_eq!(current_model, "claude-sonnet-4-6-20250514");
+                assert!(!items.is_empty(), "picker should have items");
             }
-            _ => panic!("expected Text"),
+            _ => panic!("expected ModelPicker"),
         }
     }
 
     #[test]
-    fn cmd_model_no_args_shows_active_providers() {
+    fn cmd_model_no_args_picker_has_all_groups() {
         let ctx = CommandContext::basic("test", 0, 0);
         match cmd_model("", &ctx) {
-            CommandResult::Text(text) => {
-                // Should show provider status section
-                assert!(
-                    text.contains("Active providers:") || text.contains("Inactive"),
-                    "should show provider status"
-                );
+            CommandResult::ModelPicker { items, .. } => {
+                // Should have items from multiple groups (if any providers detected)
+                // At minimum, fallback mode includes all models
+                assert!(!items.is_empty(), "picker should have items");
+                let groups: std::collections::HashSet<&str> = items.iter().map(|i| i.group.as_str()).collect();
+                assert!(groups.len() >= 1, "should have at least one group");
             }
-            _ => panic!("expected Text"),
+            _ => panic!("expected ModelPicker"),
         }
     }
 

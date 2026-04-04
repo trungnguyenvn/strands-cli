@@ -10,6 +10,7 @@ use crate::commands::{
     self, CommandContext, CommandKind, CommandRegistry, CommandResult,
     DispatchResult, SuggestionItem,
 };
+use crate::mcp::McpSession;
 
 // ---------------------------------------------------------------------------
 // State types
@@ -20,6 +21,16 @@ pub enum AgentStatus {
     Idle,
     Streaming,
     Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum McpStatus {
+    /// No MCP config found or not yet started.
+    None,
+    /// Background loading in progress.
+    Loading,
+    /// Some servers failed — show warning briefly then disappear.
+    Warning { failed: usize, expire_tick: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -126,10 +137,14 @@ pub struct AppState {
     pub suggestions: Vec<SuggestionItem>,
     /// Index of the selected suggestion (-1 = none). Mirrors Claude Code's `selectedSuggestion`.
     pub selected_suggestion: i32,
+    /// Connected MCP server info (for /mcp command).
+    pub mcp_servers: Vec<crate::mcp::McpServerInfo>,
+    /// MCP loading status for the status bar.
+    pub mcp_status: McpStatus,
 }
 
 impl AppState {
-    pub fn new(model_name: String, command_registry: CommandRegistry) -> Self {
+    pub fn new(model_name: String, command_registry: CommandRegistry, mcp_servers: Vec<crate::mcp::McpServerInfo>) -> Self {
         let mut input = tui_textarea::TextArea::default();
         input.set_cursor_line_style(ratatui::style::Style::default());
         input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
@@ -153,6 +168,8 @@ impl AppState {
             command_registry,
             suggestions: Vec::new(),
             selected_suggestion: -1,
+            mcp_servers,
+            mcp_status: McpStatus::Loading,
         }
     }
 }
@@ -164,13 +181,37 @@ impl AppState {
 pub struct TuiApp {
     pub state: AppState,
     agent: Agent,
+    /// MCP clients kept alive for session duration (Drop kills subprocesses / closes HTTP sessions).
+    #[allow(dead_code)]
+    _mcp_clients: Option<(Vec<strands::tools::mcp::MCPClient>, Vec<strands::tools::mcp::MCPHttpClient>)>,
 }
 
 impl TuiApp {
     pub fn new(agent: Agent, model_name: String, command_registry: CommandRegistry) -> Self {
         Self {
-            state: AppState::new(model_name, command_registry),
+            state: AppState::new(model_name, command_registry, Vec::new()),
             agent,
+            _mcp_clients: None,
+        }
+    }
+
+    /// Absorb a loaded MCP session — registers tools on the agent at runtime
+    /// and stores clients to keep subprocesses / HTTP sessions alive.
+    pub fn apply_mcp_session(&mut self, session: McpSession) {
+        let failed = session.failed_count;
+        for tool in &session.tools {
+            self.agent.add_tool(tool.clone());
+        }
+        self.state.mcp_servers = session.servers;
+        self._mcp_clients = Some((session.stdio_clients, session.http_clients));
+        if failed > 0 {
+            // Show warning for ~2 seconds (tick rate = 12 Hz → 24 ticks)
+            self.state.mcp_status = McpStatus::Warning {
+                failed,
+                expire_tick: self.state.tick_count + 24,
+            };
+        } else {
+            self.state.mcp_status = McpStatus::None;
         }
     }
 
@@ -190,6 +231,7 @@ impl TuiApp {
                 turn_count: self.state.turn_count,
                 message_count: self.state.messages.len(),
                 all_commands: self.state.command_registry.command_infos(),
+                mcp_servers: self.state.mcp_servers.clone(),
             };
             match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {
                 DispatchResult::Local(CommandResult::Quit) => {
@@ -216,39 +258,15 @@ impl TuiApp {
                     self.reset_input();
                     return;
                 }
+                DispatchResult::Local(CommandResult::ModelPicker { .. }) => {
+                    // Set input to "/model " and show model suggestions inline
+                    self.set_input("/model ");
+                    self.update_suggestions();
+                    return;
+                }
                 DispatchResult::Local(CommandResult::SwitchModel(model_id)) => {
-                    self.state.messages.push(ChatMessage::user(trimmed.to_string()));
-                    let mut msg = ChatMessage::assistant_empty();
-                    msg.append_text(&format!("Switching model to {}...", model_id));
-                    self.state.messages.push(msg);
-                    self.state.auto_scroll = true;
-                    self.state.scroll_offset = 0;
                     self.reset_input();
-
-                    // Build new model and swap (async)
-                    let agent = self.agent.clone();
-                    let event_tx_clone = event_tx.clone();
-                    let model_id_clone = model_id.clone();
-                    let new_model_name = model_id.clone();
-                    tokio::spawn(async move {
-                        match crate::build_model_by_id(&model_id_clone).await {
-                            Ok(new_model) => {
-                                agent.swap_model(new_model);
-                                let _ = event_tx_clone.send(Event::AgentTextDelta(
-                                    format!("\nModel switched to {}", model_id_clone),
-                                ));
-                                let _ = event_tx_clone.send(Event::AgentDone);
-                            }
-                            Err(e) => {
-                                let _ = event_tx_clone.send(Event::AgentError(
-                                    format!("Failed to switch model: {}", e),
-                                ));
-                                let _ = event_tx_clone.send(Event::AgentDone);
-                            }
-                        }
-                    });
-                    self.state.model_name = new_model_name;
-                    self.state.agent_status = AgentStatus::Streaming;
+                    self.switch_model(model_id, event_tx);
                     return;
                 }
                 DispatchResult::Prompt(expanded) => {
@@ -350,6 +368,7 @@ impl TuiApp {
             turn_count: self.state.turn_count,
             message_count: self.state.messages.len(),
             all_commands: self.state.command_registry.command_infos(),
+            mcp_servers: self.state.mcp_servers.clone(),
         };
 
         match commands::dispatch(trimmed, &self.state.command_registry, &ctx) {
@@ -387,7 +406,45 @@ impl TuiApp {
     }
 
     /// Reset the input textarea to its default state.
-    fn reset_input(&mut self) {
+    /// Switch the model — shows a message and spawns async build+swap.
+    /// Used by both `/model <alias>` dispatch and the interactive picker.
+    pub fn switch_model(
+        &mut self,
+        model_id: String,
+        event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    ) {
+        self.state.messages.push(ChatMessage::user(format!("/model {}", model_id)));
+        let mut msg = ChatMessage::assistant_empty();
+        msg.append_text(&format!("Switching model to {}...", model_id));
+        self.state.messages.push(msg);
+        self.state.auto_scroll = true;
+        self.state.scroll_offset = 0;
+
+        let agent = self.agent.clone();
+        let event_tx_clone = event_tx.clone();
+        let model_id_clone = model_id.clone();
+        tokio::spawn(async move {
+            match crate::build_model_by_id(&model_id_clone).await {
+                Ok(new_model) => {
+                    agent.swap_model(new_model);
+                    let _ = event_tx_clone.send(Event::AgentTextDelta(
+                        format!("\nModel switched to {}", model_id_clone),
+                    ));
+                    let _ = event_tx_clone.send(Event::AgentDone);
+                }
+                Err(e) => {
+                    let _ = event_tx_clone.send(Event::AgentError(
+                        format!("Failed to switch model: {}", e),
+                    ));
+                    let _ = event_tx_clone.send(Event::AgentDone);
+                }
+            }
+        });
+        self.state.model_name = model_id;
+        self.state.agent_status = AgentStatus::Streaming;
+    }
+
+    pub fn reset_input(&mut self) {
         self.state.input = tui_textarea::TextArea::default();
         self.state.input.set_cursor_line_style(ratatui::style::Style::default());
         self.state.input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
@@ -395,12 +452,22 @@ impl TuiApp {
         self.state.selected_suggestion = -1;
     }
 
+    /// Set the input textarea to a specific string.
+    fn set_input(&mut self, text: &str) {
+        self.state.input = tui_textarea::TextArea::default();
+        self.state.input.set_cursor_line_style(ratatui::style::Style::default());
+        self.state.input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
+        for ch in text.chars() {
+            self.state.input.insert_char(ch);
+        }
+    }
+
     /// Update autocomplete suggestions based on current input.
     /// Called after every keystroke. Mirrors Claude Code's `updateSuggestions`.
     pub fn update_suggestions(&mut self) {
         let text = self.state.input.lines().join("\n");
         let new_suggestions =
-            commands::generate_suggestions(&text, &self.state.command_registry);
+            commands::generate_suggestions(&text, &self.state.command_registry, &self.state.model_name);
 
         if new_suggestions.is_empty() {
             self.state.suggestions.clear();
@@ -435,6 +502,7 @@ impl TuiApp {
     }
 
     /// Accept the currently selected suggestion — replace input with `/command `.
+    /// For model suggestions, fills `/model <alias> ` instead.
     /// Mirrors Claude Code's `applyCommandSuggestion`.
     pub fn accept_suggestion(&mut self) {
         if self.state.selected_suggestion < 0
@@ -442,22 +510,31 @@ impl TuiApp {
         {
             return;
         }
-        let name = self.state.suggestions[self.state.selected_suggestion as usize]
-            .name
-            .clone();
-        let new_input = format!("/{} ", name);
+        let suggestion = self.state.suggestions[self.state.selected_suggestion as usize].clone();
 
-        // Replace textarea content
-        self.state.input = tui_textarea::TextArea::default();
-        self.state.input.set_cursor_line_style(ratatui::style::Style::default());
-        self.state.input.set_placeholder_text("Type a message... (Enter to send, Alt+Enter for newline)");
-        for ch in new_input.chars() {
-            self.state.input.insert_char(ch);
-        }
+        let new_input = if suggestion.model_id.is_some() {
+            format!("/model {} ", suggestion.name)
+        } else {
+            format!("/{} ", suggestion.name)
+        };
+
+        self.set_input(&new_input);
 
         // Clear suggestions after accepting
         self.state.suggestions.clear();
         self.state.selected_suggestion = -1;
+    }
+
+    /// If the selected suggestion is a model, return its model_id for direct switching.
+    pub fn selected_model_id(&self) -> Option<String> {
+        if self.state.selected_suggestion < 0
+            || self.state.selected_suggestion as usize >= self.state.suggestions.len()
+        {
+            return None;
+        }
+        self.state.suggestions[self.state.selected_suggestion as usize]
+            .model_id
+            .clone()
     }
 
     /// Run the agent stream, forwarding events to the TUI event channel.
