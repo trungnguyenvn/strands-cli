@@ -12,6 +12,7 @@ use colored::Colorize;
 use serde_json::json;
 
 use strands::agent::state::AgentState;
+use strands::session::SessionManager as _;
 use strands::tools::FunctionTool;
 use strands::types::content::Message;
 use strands::types::tools::{AgentTool, ToolResult, ToolUse};
@@ -192,6 +193,8 @@ async fn main() -> Result<()> {
     .await
     .map_err(|e| strands::Error::Session(format!("journal init: {e}")))?;
     session::set_journal(Arc::clone(&journal_mgr));
+    // Keep a clone for registering hooks after agent build (the Arc is moved into the builder)
+    let journal_for_hooks = Arc::clone(&journal_mgr);
 
     // Build agent with proactive context management
     let summarizing = Arc::new(
@@ -232,6 +235,36 @@ async fn main() -> Result<()> {
     }
 
     let agent = builder.build().await?;
+
+    // Register journal session hooks so every message is persisted to disk.
+    // The SDK's `session_manager.register_hooks()` is a no-op for JournalSessionManager;
+    // the real hooks must be registered via `register_journal_hooks` or manually.
+    // We use agent.add_hook() since the agent's HookRegistry is already built.
+    {
+        let mgr = Arc::clone(&journal_for_hooks);
+        agent.add_hook(move |event: &strands::hooks::MessageAddedEvent| {
+            let mgr2 = Arc::clone(&mgr);
+            let message = event.message.clone();
+            let agent_id = event.agent_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mgr2.append_message(message, &agent_id).await {
+                    eprintln!("Journal: failed to append message: {e}");
+                }
+            });
+        });
+    }
+    {
+        let mgr = Arc::clone(&journal_for_hooks);
+        agent.add_hook(move |event: &strands::hooks::AfterInvocationEvent| {
+            let mgr2 = Arc::clone(&mgr);
+            let agent_id = event.agent_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mgr2.sync_agent(serde_json::json!({}), &agent_id).await {
+                    eprintln!("Journal: failed to sync agent: {e}");
+                }
+            });
+        });
+    }
 
     // Dispatch
     if let Some(prompt) = &cli.oneshot {

@@ -251,6 +251,157 @@ fn rand_u48() -> u64 {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Integration: journal persistence round-trip
+    // -----------------------------------------------------------------------
+
+    /// Verify that JournalSessionManager actually writes a JSONL file when
+    /// `append_message` is called, and that the file can be loaded back.
+    #[tokio::test]
+    async fn journal_writes_jsonl_and_is_loadable() {
+        use strands::session::SessionManager;
+        use strands::session::journal_session_manager::{
+            build_conversation_chain, load_journal,
+        };
+        use strands::types::content::Message;
+
+        let tmp = std::env::temp_dir().join("strands-test-journal-write");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let session_id = "test-persist-001";
+        let mgr = strands::session::JournalSessionManager::new(
+            session_id.to_string(),
+            Some(tmp.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Append two messages (simulating a user turn + assistant response)
+        mgr.append_message(Message::user("Hello from test"), session_id)
+            .await
+            .unwrap();
+        mgr.append_message(
+            Message::assistant("Hi! I'm the assistant."),
+            session_id,
+        )
+        .await
+        .unwrap();
+        mgr.flush().await.unwrap();
+
+        // Verify the JSONL file exists on disk
+        let jsonl_path = tmp.join(format!("{session_id}.jsonl"));
+        assert!(jsonl_path.exists(), "JSONL file should exist after append+flush");
+        let file_size = std::fs::metadata(&jsonl_path).unwrap().len();
+        assert!(file_size > 0, "JSONL file should not be empty");
+
+        // Verify we can load it back and reconstruct the conversation chain
+        let loaded = load_journal(&jsonl_path).await.unwrap();
+        assert!(
+            loaded.last_chain_uuid.is_some(),
+            "loaded journal should have a last_chain_uuid"
+        );
+        let chain = build_conversation_chain(&loaded, loaded.last_chain_uuid.unwrap());
+        assert_eq!(chain.len(), 2, "should reconstruct 2 messages");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Verify that `list_sessions` discovers JSONL files written by the journal.
+    #[tokio::test]
+    async fn list_sessions_finds_persisted_journal() {
+        let tmp = std::env::temp_dir().join("strands-test-list-sessions");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create two sessions
+        for id in &["sess-aaa", "sess-bbb"] {
+            let mgr = strands::session::JournalSessionManager::new(
+                id.to_string(),
+                Some(tmp.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+            use strands::session::SessionManager;
+            mgr.append_message(
+                strands::types::content::Message::user("ping"),
+                id,
+            )
+            .await
+            .unwrap();
+            mgr.flush().await.unwrap();
+        }
+
+        let sessions = list_sessions(&tmp);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&"sess-aaa"), "should find sess-aaa: {ids:?}");
+        assert!(ids.contains(&"sess-bbb"), "should find sess-bbb: {ids:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Verify the full resume round-trip: persist → list → resolve_and_load.
+    #[tokio::test]
+    async fn resume_loads_persisted_messages() {
+        use strands::session::SessionManager;
+        use strands::types::content::Message;
+
+        let tmp = std::env::temp_dir().join("strands-test-resume-roundtrip");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let session_id = "resume-test-42";
+        let mgr = strands::session::JournalSessionManager::new(
+            session_id.to_string(),
+            Some(tmp.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        mgr.append_message(Message::user("What is 2+2?"), session_id)
+            .await
+            .unwrap();
+        mgr.append_message(Message::assistant("4"), session_id)
+            .await
+            .unwrap();
+        mgr.flush().await.unwrap();
+
+        // Resume by session ID
+        let (loaded_id, msgs) = resolve_and_load(&tmp, session_id).await.unwrap();
+        assert_eq!(loaded_id, session_id);
+        assert_eq!(msgs.len(), 2, "should load 2 messages");
+
+        // Resume by "latest"
+        let (latest_id, latest_msgs) = resolve_and_load(&tmp, "latest").await.unwrap();
+        assert_eq!(latest_id, session_id);
+        assert_eq!(latest_msgs.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Verify that resuming a non-existent session returns an error.
+    #[tokio::test]
+    async fn resume_nonexistent_session_returns_error() {
+        let tmp = std::env::temp_dir().join("strands-test-resume-missing");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let result = resolve_and_load(&tmp, "does-not-exist").await;
+        assert!(result.is_err(), "should error for missing session");
+
+        let result = resolve_and_load(&tmp, "latest").await;
+        assert!(result.is_err(), "should error when no sessions exist");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn session_id_is_uuid_format() {
         let id = SessionId::new();
