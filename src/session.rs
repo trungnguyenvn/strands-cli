@@ -185,7 +185,89 @@ pub async fn resolve_and_load(
         Vec::new()
     };
 
+    let messages = sanitize_messages_for_api(messages);
+
     Ok((session_id, messages))
+}
+
+// ---------------------------------------------------------------------------
+// Message sanitization for API compatibility
+// ---------------------------------------------------------------------------
+
+/// Fix tool_use / tool_result mismatches in a resumed conversation.
+///
+/// The Bedrock API (and others) require that every `ToolResult` in a user
+/// message corresponds to a `ToolUse` in the immediately preceding assistant
+/// message.  Resumed conversations can violate this if the session was
+/// interrupted mid-tool-loop.
+///
+/// This function:
+/// 1. Collects `tool_use_id`s from each assistant message.
+/// 2. In the following user message, keeps only `ToolResult` blocks whose
+///    `tool_use_id` appears in the preceding assistant's tool_use set.
+/// 3. Drops messages that become empty after stripping.
+/// 4. Ensures the conversation ends with a user or assistant message (not
+///    an orphaned tool result).
+fn sanitize_messages_for_api(
+    messages: Vec<strands::types::content::Message>,
+) -> Vec<strands::types::content::Message> {
+    use std::collections::HashSet;
+    use strands::types::content::{ContentBlock, Role};
+
+    if messages.is_empty() {
+        return messages;
+    }
+
+    let mut result: Vec<strands::types::content::Message> = Vec::with_capacity(messages.len());
+    let mut prev_tool_use_ids: HashSet<String> = HashSet::new();
+
+    for msg in messages {
+        if msg.role == Role::Assistant {
+            // Collect tool_use_ids from this assistant message
+            prev_tool_use_ids.clear();
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { tool_use_id, .. } = block {
+                    prev_tool_use_ids.insert(tool_use_id.clone());
+                }
+            }
+            result.push(msg);
+        } else if msg.role == Role::User {
+            // Filter tool_result blocks: keep only those matching a preceding tool_use.
+            // If the preceding assistant had no tool_uses, ALL tool_results are orphaned.
+            let mut filtered_msg = msg;
+            filtered_msg.content.retain(|block| {
+                match block {
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        prev_tool_use_ids.contains(tool_use_id)
+                    }
+                    _ => true, // keep text and other blocks
+                }
+            });
+
+            prev_tool_use_ids.clear();
+
+            if !filtered_msg.content.is_empty() {
+                result.push(filtered_msg);
+            }
+        } else {
+            prev_tool_use_ids.clear();
+            result.push(msg);
+        }
+    }
+
+    // Ensure conversation doesn't end mid-tool-exchange: if the last message
+    // is a user message containing only tool results, the model will expect to
+    // continue from there. That's fine — it's a valid resume point. We only
+    // strip if the conversation ends with assistant tool_uses but NO following
+    // user tool_results (the session was killed mid-tool-execution).
+    if result.last().map_or(false, |m| {
+        m.role == Role::Assistant
+            && m.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    }) {
+        result.pop(); // drop incomplete assistant tool_use without results
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +476,72 @@ mod tests {
         assert!(result.is_err(), "should error when no sessions exist");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Message sanitization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_strips_orphaned_tool_results() {
+        use strands::types::content::{ContentBlock, Message, Role};
+
+        let messages = vec![
+            // Assistant with one tool_use
+            Message::new(Role::Assistant, vec![ContentBlock::ToolUse {
+                tool_use_id: "tu-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({}),
+                cache_point: None,
+            }]),
+            // User with matching tool_result + an orphaned one
+            Message::new(Role::User, vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "tu-1".into(),
+                    content: vec![],
+                    is_error: false,
+                    cache_point: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "tu-ORPHAN".into(),
+                    content: vec![],
+                    is_error: false,
+                    cache_point: None,
+                },
+            ]),
+        ];
+
+        let fixed = sanitize_messages_for_api(messages);
+        assert_eq!(fixed.len(), 2);
+        // The user message should only have tu-1, not tu-ORPHAN
+        assert_eq!(fixed[1].content.len(), 1, "orphaned tool_result should be stripped");
+        match &fixed[1].content[0] {
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                assert_eq!(tool_use_id, "tu-1");
+            }
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_user_message_with_only_orphaned_results() {
+        use strands::types::content::{ContentBlock, Message, Role};
+
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant("hi"),
+            // User message with only orphaned tool results (no preceding tool_use)
+            Message::new(Role::User, vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-GONE".into(),
+                content: vec![],
+                is_error: false,
+                cache_point: None,
+            }]),
+        ];
+
+        let fixed = sanitize_messages_for_api(messages);
+        // The orphaned user message should be dropped entirely
+        assert_eq!(fixed.len(), 2, "orphaned tool-result-only message should be dropped");
     }
 
     // -----------------------------------------------------------------------
