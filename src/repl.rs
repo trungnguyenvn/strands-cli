@@ -172,7 +172,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                                         Ok((id, msgs)) => {
                                             agent.clear_history();
                                             for m in &msgs {
-                                                agent.load_message(m.clone());
+                                                agent.add_message_silent(m.clone());
                                             }
                                             message_count = msgs.len();
                                             println!("{}", format!("Resumed session {} ({} messages)", id, msgs.len()).green());
@@ -209,7 +209,7 @@ pub async fn run_repl(agent: &Agent, registry: CommandRegistry, mcp_servers: Vec
                         Ok((id, msgs)) => {
                             agent.clear_history();
                             for m in &msgs {
-                                agent.load_message(m.clone());
+                                agent.add_message_silent(m.clone());
                             }
                             message_count = msgs.len();
                             println!("{}", format!("Resumed session {} ({} messages)", id, msgs.len()).green());

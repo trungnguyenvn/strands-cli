@@ -144,14 +144,10 @@ pub async fn run(agent: Agent, model_name: String, command_registry: crate::comm
                 // Clear the "/resume ..." placeholder messages
                 app.state.messages.clear();
                 app.state.clear_render_caches();
-                // Convert SDK messages to display ChatMessages
-                for msg in &messages {
-                    let chat_msg = app::ChatMessage::from_sdk_message(msg);
-                    // Skip empty messages (e.g. tool results with no text)
-                    if !chat_msg.blocks.is_empty() {
-                        app.state.messages.push(chat_msg);
-                    }
-                }
+                // Rebuild display list using full-list reordering (normalizeMessages +
+                // reorderMessagesInUI): each ToolUse is immediately followed by its
+                // paired ToolResult, and user-only-ToolResult messages are skipped.
+                app.state.messages = app::rebuild_display_messages(&messages);
                 // Update turn count to reflect resumed history
                 app.state.turn_count = app.state.messages.iter()
                     .filter(|m| matches!(m.role, app::Role::User))

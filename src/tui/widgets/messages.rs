@@ -24,7 +24,10 @@ use crate::tui::app::{
     StreamingMdCache, ToolCallStatus,
 };
 use crate::tui::widgets::markdown::{find_stable_boundary, markdown_to_lines};
-use crate::tui::widgets::tool_call::{render_tool_call, render_tool_call_group};
+use crate::tui::widgets::tool_call::{
+    render_collapsed_read_search, render_thinking_block, render_tool_call, render_tool_call_group,
+    render_tool_result,
+};
 
 /// Left margin prefix for all message content.
 const MARGIN: &str = "  ";
@@ -281,6 +284,7 @@ fn render_assistant_blocks(
                 summary,
                 status,
                 group_key,
+                ..
             } => {
                 // Try to collapse consecutive same-group successful tool calls
                 if let Some(gk) = group_key {
@@ -294,6 +298,7 @@ fn render_assistant_blocks(
                                 summary: s2,
                                 status: st2,
                                 group_key: Some(gk2),
+                                ..
                             } = &blocks[j]
                             {
                                 if gk2 == gk && *st2 == ToolCallStatus::Success {
@@ -305,7 +310,28 @@ fn render_assistant_blocks(
                             break;
                         }
                         if run.len() > 1 {
-                            let mut line = render_tool_call_group(&run);
+                            let mut line = if *gk == "search" {
+                                let mut reads = 0usize;
+                                let mut searches = 0usize;
+                                let mut fetches = 0usize;
+                                let mut file_paths: Vec<&str> = Vec::new();
+                                for (tool_name, tool_summary) in &run {
+                                    match *tool_name {
+                                        "Read" => {
+                                            reads += 1;
+                                            if !tool_summary.is_empty() {
+                                                file_paths.push(tool_summary);
+                                            }
+                                        }
+                                        "Grep" | "Glob" => searches += 1,
+                                        "WebFetch" | "WebSearch" => fetches += 1,
+                                        _ => {}
+                                    }
+                                }
+                                render_collapsed_read_search(reads, searches, fetches, &file_paths)
+                            } else {
+                                render_tool_call_group(&run)
+                            };
                             line.spans.insert(0, margin.clone());
                             lines.push(line);
                             i = j;
@@ -316,6 +342,20 @@ fn render_assistant_blocks(
                 let mut line = render_tool_call(name, summary, status, tick);
                 line.spans.insert(0, margin.clone());
                 lines.push(line);
+                i += 1;
+            }
+            ContentBlock::ToolResult { text, is_error, .. } => {
+                for mut line in render_tool_result(text, *is_error) {
+                    line.spans.insert(0, margin.clone());
+                    lines.push(line);
+                }
+                i += 1;
+            }
+            ContentBlock::Thinking(text) => {
+                for mut line in render_thinking_block(text) {
+                    line.spans.insert(0, margin.clone());
+                    lines.push(line);
+                }
                 i += 1;
             }
         }
@@ -381,6 +421,18 @@ fn render_streaming_message(
                 let mut line = render_tool_call(name, summary, status, tick);
                 line.spans.insert(0, margin.clone());
                 lines.push(line);
+            }
+            ContentBlock::ToolResult { text, is_error, .. } => {
+                for mut line in render_tool_result(text, *is_error) {
+                    line.spans.insert(0, margin.clone());
+                    lines.push(line);
+                }
+            }
+            ContentBlock::Thinking(text) => {
+                for mut line in render_thinking_block(text) {
+                    line.spans.insert(0, margin.clone());
+                    lines.push(line);
+                }
             }
         }
     }

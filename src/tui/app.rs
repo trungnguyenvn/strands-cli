@@ -1,5 +1,6 @@
 //! Application state and event dispatch for the TUI.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -38,11 +39,19 @@ pub enum McpStatus {
 #[derive(Clone, Debug)]
 pub enum ContentBlock {
     Text(String),
+    /// Reasoning/thinking content (collapsed display, mirrors TS AssistantThinkingMessage).
+    Thinking(String),
     ToolCall {
         name: String,
+        tool_use_id: String,
         summary: String,
         status: ToolCallStatus,
         group_key: Option<&'static str>,
+    },
+    ToolResult {
+        tool_use_id: String,
+        text: String,
+        is_error: bool,
     },
 }
 
@@ -96,10 +105,11 @@ impl ChatMessage {
         }
     }
 
-    pub fn add_tool_call(&mut self, name: String, summary: String, status: ToolCallStatus) {
+    pub fn add_tool_call(&mut self, name: String, tool_use_id: String, summary: String, status: ToolCallStatus) {
         let group_key = tool_group_key(&name);
         self.blocks.push(ContentBlock::ToolCall {
             name,
+            tool_use_id,
             summary,
             status,
             group_key,
@@ -111,6 +121,19 @@ impl ChatMessage {
             if let ContentBlock::ToolCall { status, .. } = block {
                 *status = new_status;
                 return;
+            }
+        }
+    }
+
+    /// Update the status of the ToolCall block identified by `tool_use_id`.
+    /// Falls back to the last ToolCall if `tool_use_id` is empty or not found.
+    pub fn set_tool_status_by_id(&mut self, tool_use_id: &str, new_status: ToolCallStatus) {
+        for block in self.blocks.iter_mut().rev() {
+            if let ContentBlock::ToolCall { tool_use_id: ref id, status, .. } = block {
+                if tool_use_id.is_empty() || id == tool_use_id {
+                    *status = new_status;
+                    return;
+                }
             }
         }
     }
@@ -128,31 +151,36 @@ impl ChatMessage {
                 strands::types::content::ContentBlock::Text { text, .. } => {
                     blocks.push(ContentBlock::Text(text.clone()));
                 }
-                strands::types::content::ContentBlock::ToolUse { name, input, .. } => {
+                strands::types::content::ContentBlock::ToolUse { tool_use_id, name, input, .. } => {
                     let summary = crate::repl::tool_call_summary(name, input);
                     blocks.push(ContentBlock::ToolCall {
                         name: name.clone(),
+                        tool_use_id: tool_use_id.clone(),
                         summary,
                         status: ToolCallStatus::Success,
                         group_key: tool_group_key(name),
                     });
                 }
-                strands::types::content::ContentBlock::ToolResult { content, is_error, .. } => {
-                    // Show tool results as text (truncated)
+                strands::types::content::ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
                     let text = content.iter().filter_map(|c| {
                         c.text.as_deref()
                     }).collect::<Vec<_>>().join("");
                     if !text.is_empty() {
-                        let truncated = if text.len() > 200 {
-                            format!("{}…", &text[..199])
-                        } else {
-                            text
-                        };
-                        let status = if *is_error { "error" } else { "success" };
-                        blocks.push(ContentBlock::Text(format!("[{}: {}]", status, truncated)));
+                        let truncated = truncate_result_text(&text, 500);
+                        blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            text: truncated,
+                            is_error: *is_error,
+                        });
                     }
                 }
-                _ => {} // Skip Image, Document, etc.
+                strands::types::content::ContentBlock::ReasoningContent { reasoning_content, .. } => {
+                    let text = reasoning_content.text.text.clone();
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::Thinking(text));
+                    }
+                }
+                _ => {} // Skip Image, Document, Video, etc.
             }
         }
         Self { role, blocks }
@@ -162,16 +190,162 @@ impl ChatMessage {
     pub fn text_content(&self) -> String {
         self.blocks
             .iter()
-            .filter_map(|b| {
-                if let ContentBlock::Text(t) = b {
-                    Some(t.as_str())
-                } else {
-                    None
-                }
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                ContentBlock::ToolResult { text, .. } => Some(text.as_str()),
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join("")
     }
+}
+
+/// Rebuild the display message list from a slice of SDK messages.
+///
+/// Matches TypeScript's `normalizeMessages()` + `reorderMessagesInUI()`:
+/// - Each Text block in an assistant message becomes its own `ChatMessage`.
+/// - Each ToolUse block becomes its own `ChatMessage` (normalization).
+/// - Each ToolUse `ChatMessage` has the matching `ToolResult` block embedded
+///   immediately after the `ToolCall` block (reordering).
+/// - User messages that contain only `ToolResult` blocks are skipped — those
+///   results are already paired with their tool call `ChatMessage` above.
+/// - User messages with actual `Text` content are emitted as `Role::User` messages.
+pub fn rebuild_display_messages(
+    sdk_messages: &[strands::types::content::Message],
+) -> Vec<ChatMessage> {
+    use strands::types::content::ContentBlock as SdkBlock;
+    use strands::types::content::Role as SdkRole;
+
+    // Phase 1: Collect all ToolResult blocks into a map keyed by tool_use_id.
+    let mut result_map: HashMap<String, (String, bool)> = HashMap::new();
+    for msg in sdk_messages {
+        for block in &msg.content {
+            if let SdkBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } = block
+            {
+                let text = content
+                    .iter()
+                    .filter_map(|c| c.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("");
+                let truncated = truncate_result_text(&text, 500);
+                result_map.insert(tool_use_id.clone(), (truncated, *is_error));
+            }
+        }
+    }
+
+    // Phase 2 + 3: Walk all SDK messages in order.
+    // Assistant messages: emit one ChatMessage per Text or ToolUse block.
+    // User messages: emit only if they have non-ToolResult text content.
+    let mut output: Vec<ChatMessage> = Vec::new();
+
+    for msg in sdk_messages {
+        match msg.role {
+            SdkRole::Assistant => {
+                for block in &msg.content {
+                    match block {
+                        SdkBlock::Text { text, .. } if !text.trim().is_empty() => {
+                            output.push(ChatMessage {
+                                role: Role::Assistant,
+                                blocks: vec![ContentBlock::Text(text.clone())],
+                            });
+                        }
+                        SdkBlock::ToolUse {
+                            tool_use_id,
+                            name,
+                            input,
+                            ..
+                        } => {
+                            let summary = crate::repl::tool_call_summary(name, input);
+                            let (tool_status, result_block) = match result_map.get(tool_use_id) {
+                                Some((result_text, is_error)) => {
+                                    let status = if *is_error {
+                                        ToolCallStatus::Error
+                                    } else {
+                                        ToolCallStatus::Success
+                                    };
+                                    let result = if !result_text.is_empty() {
+                                        Some(ContentBlock::ToolResult {
+                                            tool_use_id: tool_use_id.clone(),
+                                            text: result_text.clone(),
+                                            is_error: *is_error,
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    (status, result)
+                                }
+                                None => {
+                                    // No result found — mark as success (completed in prior session)
+                                    (ToolCallStatus::Success, None)
+                                }
+                            };
+
+                            let mut blocks = vec![ContentBlock::ToolCall {
+                                name: name.clone(),
+                                tool_use_id: tool_use_id.clone(),
+                                summary,
+                                status: tool_status,
+                                group_key: tool_group_key(name),
+                            }];
+                            if let Some(rb) = result_block {
+                                blocks.push(rb);
+                            }
+                            output.push(ChatMessage {
+                                role: Role::Assistant,
+                                blocks,
+                            });
+                        }
+                        SdkBlock::ReasoningContent {
+                            reasoning_content,
+                            ..
+                        } => {
+                            let text = reasoning_content.text.text.clone();
+                            if !text.is_empty() {
+                                output.push(ChatMessage {
+                                    role: Role::Assistant,
+                                    blocks: vec![ContentBlock::Thinking(text)],
+                                });
+                            }
+                        }
+                        _ => {
+                            // Skip Image, Document, Video, GuardContent, whitespace-only Text
+                        }
+                    }
+                }
+            }
+            SdkRole::User => {
+                // Collect non-empty text blocks in a single pass. User messages that
+                // contain only ToolResult blocks are implicitly skipped — ToolResults
+                // are already embedded in the paired ToolUse ChatMessages above.
+                let blocks: Vec<ContentBlock> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        SdkBlock::Text { text, .. } if !text.trim().is_empty() => {
+                            Some(ContentBlock::Text(text.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !blocks.is_empty() {
+                    output.push(ChatMessage {
+                        role: Role::User,
+                        blocks,
+                    });
+                }
+            }
+            _ => {
+                // System, Developer, Tool roles are not displayed in the chat history
+            }
+        }
+    }
+
+    output
 }
 
 /// Text selection state for mouse-based copy.
@@ -303,8 +477,21 @@ impl MessageCacheEntry {
 fn msg_text_len(msg: &ChatMessage) -> usize {
     msg.blocks.iter().map(|b| match b {
         ContentBlock::Text(t) => t.len(),
+        ContentBlock::Thinking(t) => t.len(),
+        ContentBlock::ToolResult { text, .. } => text.len(),
         _ => 0,
     }).sum()
+}
+
+/// Truncate text to `max_chars` chars, appending `…` if truncated.
+fn truncate_result_text(text: &str, max_chars: usize) -> String {
+    // Use char_indices to avoid a full O(n) count when the text is shorter than max_chars.
+    let mut chars = text.char_indices();
+    match chars.nth(max_chars - 1) {
+        None => text.to_string(), // fewer than max_chars chars
+        Some(_) if chars.next().is_none() => text.to_string(), // exactly max_chars chars
+        Some((byte_pos, _)) => format!("{}…", &text[..byte_pos]),
+    }
 }
 
 fn msg_has_running_tool(msg: &ChatMessage) -> bool {
@@ -1525,10 +1712,10 @@ impl TuiApp {
             match crate::session::resolve_and_load_full(&sessions_dir, &session_ref).await {
                 Ok(resolved) => {
                     // Replace agent conversation with loaded messages.
-                    // Use load_message (no hooks) to avoid re-writing them to the journal.
+                    // Use add_message_silent (no hooks) to avoid re-writing them to the journal.
                     agent.clear_history();
                     for m in &resolved.messages {
-                        agent.load_message(m.clone());
+                        agent.add_message_silent(m.clone());
                     }
                     // Load the session title if available
                     if let Some(title) = resolved.title {
@@ -1539,9 +1726,6 @@ impl TuiApp {
                         session_id: resolved.session_id.clone(),
                         messages: resolved.messages.clone(),
                     });
-                    let _ = event_tx_clone.send(Event::AgentTextDelta(
-                        format!("\nResumed session {} ({} messages)", resolved.session_id, resolved.messages.len()),
-                    ));
                     let _ = event_tx_clone.send(Event::AgentDone);
                 }
                 Err(e) => {
@@ -1607,17 +1791,28 @@ impl TuiApp {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("?")
                                         .to_string();
+                                    let tool_use_id = ev
+                                        .get("tool_use_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     let input = ev
                                         .get("input")
                                         .cloned()
                                         .unwrap_or(serde_json::Value::Null);
                                     let _ = event_tx.send(Event::AgentToolStart {
                                         name: name.clone(),
+                                        tool_use_id: tool_use_id.clone(),
                                     });
-                                    Some(Event::AgentToolCall { name, input })
+                                    Some(Event::AgentToolCall { name, input, tool_use_id })
                                 }
                                 "tool_result" => {
                                     let tool_name = ev.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let tool_use_id = ev
+                                        .get("tool_use_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     let status = if let Some(s) = ev.get("status").and_then(|v| v.as_str()) {
                                         s.to_string()
                                     } else if ev.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -1653,15 +1848,21 @@ impl TuiApp {
                                         break; // AgentDone sent after loop
                                     }
 
-                                    Some(Event::AgentToolResult { status, content })
+                                    Some(Event::AgentToolResult { status, content, tool_use_id })
                                 }
                                 "message_stop" | "stream_complete" => {
                                     Some(Event::AgentDone)
                                 }
+                                "reasoning_delta" => {
+                                    ev.get("text")
+                                        .and_then(|v| v.as_str())
+                                        .map(|t| Event::AgentReasoningDelta(t.to_string()))
+                                }
                                 "content_block_start" | "content_block_stop"
                                 | "message_start" | "tool_execution_start"
                                 | "tool_execution_progress"
-                                | "tool_execution_complete" => None,
+                                | "tool_execution_complete"
+                                | "reasoning_start" | "reasoning_complete" => None,
                                 _ => {
                                     ev.get("data")
                                         .and_then(|d| d.as_str())
@@ -1842,12 +2043,48 @@ impl TuiApp {
         self.state.scroll_offset = 0;
     }
 
-    pub fn handle_agent_event(&mut self, event: Event) {
-        let last_msg = self.state.messages.last_mut();
+    /// Find the index of the most recent message containing a Running ToolCall
+    /// matching the given `tool_use_id` (or any Running ToolCall if the ID is empty).
+    /// Searches up to `max_look_back` messages from the end.
+    fn find_running_tool_msg_idx(&self, tool_use_id: &str, max_look_back: usize) -> Option<usize> {
+        let len = self.state.messages.len();
+        let start = len.saturating_sub(max_look_back);
+        for i in (start..len).rev() {
+            let found = self.state.messages[i].blocks.iter().any(|b| match b {
+                ContentBlock::ToolCall {
+                    tool_use_id: ref id,
+                    status: ToolCallStatus::Running,
+                    ..
+                } => tool_use_id.is_empty() || id == tool_use_id,
+                _ => false,
+            });
+            if found {
+                return Some(i);
+            }
+        }
+        None
+    }
 
+    pub fn handle_agent_event(&mut self, event: Event) {
         match event {
             Event::AgentTextDelta(text) => {
-                if let Some(msg) = last_msg {
+                // If the last block of the last message is a completed ToolCall or ToolResult,
+                // push a new assistant message so text after tool execution is separated
+                // (1-block-per-message normalization, mirrors TypeScript Claude Code pipeline).
+                let needs_new_msg = self.state.messages.last().is_some_and(|msg| {
+                    match msg.blocks.last() {
+                        Some(ContentBlock::ToolCall { status, .. }) => {
+                            *status != ToolCallStatus::Running
+                        }
+                        Some(ContentBlock::ToolResult { .. }) => true,
+                        _ => false,
+                    }
+                });
+                if needs_new_msg {
+                    self.state.messages.push(ChatMessage::assistant_empty());
+                }
+
+                if let Some(msg) = self.state.messages.last_mut() {
                     msg.append_text(&text);
 
                     // Track unseen messages when user scrolled away
@@ -1859,47 +2096,82 @@ impl TuiApp {
                     }
                 }
             }
-            Event::AgentToolStart { name } => {
-                if let Some(msg) = last_msg {
-                    msg.add_tool_call(name, String::new(), ToolCallStatus::Running);
-
+            Event::AgentReasoningDelta(text) => {
+                if let Some(msg) = self.state.messages.last_mut() {
+                    if let Some(ContentBlock::Thinking(ref mut s)) = msg.blocks.last_mut() {
+                        s.push_str(&text);
+                    } else {
+                        msg.blocks.push(ContentBlock::Thinking(text));
+                    }
                 }
             }
-            Event::AgentToolCall { name, input } => {
+            Event::AgentToolStart { name, tool_use_id } => {
+                // Each tool call gets its own new message (1-block-per-message normalization).
+                let mut new_msg = ChatMessage::assistant_empty();
+                new_msg.add_tool_call(name, tool_use_id, String::new(), ToolCallStatus::Running);
+                self.state.messages.push(new_msg);
+            }
+            Event::AgentToolCall { name, input, tool_use_id } => {
                 let summary = crate::repl::tool_call_summary(&name, &input);
-                if let Some(msg) = last_msg {
-                    for block in msg.blocks.iter_mut().rev() {
+                // AgentToolStart always precedes AgentToolCall for the same tool,
+                // so the block is still Running — reuse find_running_tool_msg_idx.
+                if let Some(msg_idx) = self.find_running_tool_msg_idx(&tool_use_id, 8) {
+                    for block in self.state.messages[msg_idx].blocks.iter_mut().rev() {
                         if let ContentBlock::ToolCall {
+                            tool_use_id: ref id,
                             summary: ref mut s, ..
                         } = block
                         {
-                            *s = summary;
-                            break;
-                        }
-                    }
-
-                }
-            }
-            Event::AgentToolResult { status, content } => {
-                if let Some(msg) = last_msg {
-                    let new_status = if status == "success" {
-                        ToolCallStatus::Success
-                    } else {
-                        ToolCallStatus::Error
-                    };
-                    if new_status == ToolCallStatus::Error && !content.is_empty() {
-                        for block in msg.blocks.iter_mut().rev() {
-                            if let ContentBlock::ToolCall {
-                                summary: ref mut s, ..
-                            } = block
-                            {
-                                *s = content.clone();
+                            if tool_use_id.is_empty() || id == &tool_use_id {
+                                *s = summary;
                                 break;
                             }
                         }
                     }
-                    msg.set_last_tool_status(new_status);
+                }
+            }
+            Event::AgentToolResult { status, content, tool_use_id } => {
+                let is_error = status != "success";
+                let new_status = if is_error {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                };
 
+                // Search recent messages for the Running ToolCall to update its status.
+                if let Some(msg_idx) = self.find_running_tool_msg_idx(&tool_use_id, 8) {
+                    if new_status == ToolCallStatus::Error && !content.is_empty() {
+                        for block in self.state.messages[msg_idx].blocks.iter_mut().rev() {
+                            if let ContentBlock::ToolCall {
+                                tool_use_id: ref id,
+                                summary: ref mut s,
+                                ..
+                            } = block
+                            {
+                                if tool_use_id.is_empty() || id == &tool_use_id {
+                                    *s = content.clone();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.state.messages[msg_idx].set_tool_status_by_id(&tool_use_id, new_status);
+
+                    // Push a visible ToolResult block for errors, or meaningful success content.
+                    let show = is_error || {
+                        // Skip generic "Tool 'X' success" messages — they add no value.
+                        !content.is_empty()
+                            && !content.starts_with("Tool '")
+                            && !content.eq_ignore_ascii_case("success")
+                    };
+                    if show && !content.is_empty() {
+                        let text = truncate_result_text(&content, 500);
+                        self.state.messages[msg_idx].blocks.push(ContentBlock::ToolResult {
+                            tool_use_id,
+                            text,
+                            is_error,
+                        });
+                    }
                 }
             }
             Event::EnterPlanModeRequested => {
@@ -1994,12 +2266,12 @@ impl TuiApp {
 
                 if is_context_full {
                     self.state.agent_status = AgentStatus::Error(e.clone());
-                    if let Some(msg) = last_msg {
+                    if let Some(msg) = self.state.messages.last_mut() {
                         msg.append_text("\n[Context window full — type /compact to summarize and continue]");
                     }
                 } else {
                     self.state.agent_status = AgentStatus::Error(e.clone());
-                    if let Some(msg) = last_msg {
+                    if let Some(msg) = self.state.messages.last_mut() {
                         msg.append_text(&format!("\n[Error: {}]", e));
                     }
                 }

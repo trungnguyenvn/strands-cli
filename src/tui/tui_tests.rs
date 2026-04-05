@@ -237,14 +237,16 @@ impl TestHarness {
     /// Simulate a tool call + result in the agent stream.
     fn simulate_tool_call(&mut self, name: &str, summary: &str) {
         self.feed_agent_events(vec![
-            Event::AgentToolStart { name: name.to_string() },
+            Event::AgentToolStart { name: name.to_string(), tool_use_id: String::new() },
             Event::AgentToolCall {
                 name: name.to_string(),
                 input: serde_json::json!({"summary": summary}),
+                tool_use_id: String::new(),
             },
             Event::AgentToolResult {
                 status: "success".to_string(),
                 content: String::new(),
+                tool_use_id: String::new(),
             },
         ]);
     }
@@ -950,6 +952,7 @@ fn full_render_no_panic_with_conversation() {
     resp.append_text("Here's the explanation:\n\n```rust\nfn main() {}\n```");
     resp.add_tool_call(
         "Read".into(),
+        String::new(),
         "/src/main.rs".into(),
         super::app::ToolCallStatus::Success,
     );
@@ -1920,7 +1923,7 @@ fn streaming_tool_calls_interleaved_with_text() {
 
     // Tool call
     state.messages.last_mut().unwrap().add_tool_call(
-        "Read".into(), "src/main.rs".into(), super::app::ToolCallStatus::Running,
+        "Read".into(), String::new(), "src/main.rs".into(), super::app::ToolCallStatus::Running,
     );
 
     let buf = render_to_buffer(&mut state, 100, 40);
@@ -2186,9 +2189,9 @@ fn consecutive_search_tools_grouped() {
     let mut state = make_state(100, 30);
     state.messages.push(ChatMessage::user("find it".into()));
     let mut msg = ChatMessage::assistant_empty();
-    msg.add_tool_call("Read".into(), "file1.rs".into(), super::app::ToolCallStatus::Success);
-    msg.add_tool_call("Read".into(), "file2.rs".into(), super::app::ToolCallStatus::Success);
-    msg.add_tool_call("Grep".into(), "pattern".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Read".into(), String::new(), "file1.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Read".into(), String::new(), "file2.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Grep".into(), String::new(), "pattern".into(), super::app::ToolCallStatus::Success);
     state.messages.push(msg);
 
     let buf = render_to_buffer(&mut state, 100, 30);
@@ -2207,9 +2210,9 @@ fn mixed_tool_groups_not_collapsed() {
     let mut state = make_state(100, 30);
     state.messages.push(ChatMessage::user("do things".into()));
     let mut msg = ChatMessage::assistant_empty();
-    msg.add_tool_call("Read".into(), "file.rs".into(), super::app::ToolCallStatus::Success);
-    msg.add_tool_call("Edit".into(), "file.rs:10".into(), super::app::ToolCallStatus::Success);
-    msg.add_tool_call("Read".into(), "other.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Read".into(), String::new(), "file.rs".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Edit".into(), String::new(), "file.rs:10".into(), super::app::ToolCallStatus::Success);
+    msg.add_tool_call("Read".into(), String::new(), "other.rs".into(), super::app::ToolCallStatus::Success);
     state.messages.push(msg);
 
     let buf = render_to_buffer(&mut state, 100, 30);
@@ -2497,6 +2500,186 @@ fn harness_streaming_with_tool_calls() {
     let buf = h.render();
     assert!(buffer_contains(&buf, "Let me check"));
     assert!(buffer_contains(&buf, "Found it"));
+}
+
+// ===========================================================================
+// Unit 6: 1-block-per-message normalization
+// ===========================================================================
+
+/// AgentToolStart must create a new message, not append to the current one.
+#[test]
+fn tool_start_creates_new_message() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("do something");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    let before = h.app.state.messages.len();
+
+    h.feed_agent_events(vec![
+        Event::AgentToolStart { name: "Read".to_string(), tool_use_id: String::new() },
+    ]);
+
+    assert_eq!(
+        h.app.state.messages.len(),
+        before + 1,
+        "AgentToolStart must push a new message"
+    );
+    let last = h.app.state.messages.last().unwrap();
+    assert!(
+        last.blocks.iter().any(|b| matches!(b, super::app::ContentBlock::ToolCall { .. })),
+        "New message should contain the ToolCall block"
+    );
+}
+
+/// Two consecutive tool starts each create their own message.
+#[test]
+fn two_tool_starts_create_two_messages() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("do things");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    let before = h.app.state.messages.len();
+
+    h.feed_agent_events(vec![
+        Event::AgentToolStart { name: "Read".to_string(), tool_use_id: "t1".to_string() },
+        Event::AgentToolResult { status: "success".to_string(), content: String::new(), tool_use_id: "t1".to_string() },
+        Event::AgentToolStart { name: "Grep".to_string(), tool_use_id: "t2".to_string() },
+        Event::AgentToolResult { status: "success".to_string(), content: String::new(), tool_use_id: "t2".to_string() },
+    ]);
+
+    assert_eq!(
+        h.app.state.messages.len(),
+        before + 2,
+        "Two tool calls should produce two new messages"
+    );
+}
+
+/// Text after a completed tool result goes into a new message.
+#[test]
+fn text_after_tool_result_creates_new_message() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("analyze");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    h.feed_agent_events(vec![
+        Event::AgentTextDelta("Let me check.\n".to_string()),
+    ]);
+    let after_text = h.app.state.messages.len();
+
+    h.feed_agent_events(vec![
+        Event::AgentToolStart { name: "Read".to_string(), tool_use_id: "t1".to_string() },
+        Event::AgentToolResult { status: "success".to_string(), content: String::new(), tool_use_id: "t1".to_string() },
+    ]);
+    let after_tool = h.app.state.messages.len();
+
+    h.feed_agent_events(vec![
+        Event::AgentTextDelta("Found the issue.\n".to_string()),
+    ]);
+    let after_post_text = h.app.state.messages.len();
+
+    // Text before tool: same message count (appended)
+    assert_eq!(after_text, after_tool - 1, "Tool start should add exactly one message");
+    // Text after tool: should create a new message
+    assert_eq!(after_post_text, after_tool + 1,
+        "Text after a completed tool result must go into a new message");
+
+    // Verify content is still present
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Let me check"), "Pre-tool text should render");
+    assert!(buffer_contains(&buf, "Found the issue"), "Post-tool text should render");
+}
+
+/// Multiple consecutive text deltas go into the same message (not one each).
+#[test]
+fn consecutive_text_deltas_same_message() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("explain");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    let before = h.app.state.messages.len();
+
+    h.feed_agent_events(vec![
+        Event::AgentTextDelta("First ".to_string()),
+        Event::AgentTextDelta("second ".to_string()),
+        Event::AgentTextDelta("third.\n".to_string()),
+    ]);
+
+    assert_eq!(
+        h.app.state.messages.len(),
+        before,
+        "Consecutive text deltas must stay in the same message"
+    );
+}
+
+/// AgentToolResult finds the Running ToolCall even though it is in a different message.
+#[test]
+fn tool_result_updates_tool_call_in_earlier_message() {
+    let mut h = TestHarness::new(80, 30);
+    h.type_str("read files");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    h.feed_agent_events(vec![
+        Event::AgentToolStart { name: "Read".to_string(), tool_use_id: "t1".to_string() },
+    ]);
+
+    // Find the message that has the Running ToolCall
+    let tool_msg_idx = h.app.state.messages.iter().position(|m| {
+        m.blocks.iter().any(|b| matches!(b, super::app::ContentBlock::ToolCall {
+            status: super::app::ToolCallStatus::Running, ..
+        }))
+    }).expect("Should have a Running ToolCall message");
+
+    h.feed_agent_events(vec![
+        Event::AgentToolResult { status: "success".to_string(), content: String::new(), tool_use_id: "t1".to_string() },
+    ]);
+
+    // The ToolCall in the earlier message should now be Success
+    let tool_block = h.app.state.messages[tool_msg_idx].blocks.iter().find(|b| {
+        matches!(b, super::app::ContentBlock::ToolCall { .. })
+    }).expect("Message should still have a ToolCall block");
+
+    assert!(
+        matches!(tool_block, super::app::ContentBlock::ToolCall {
+            status: super::app::ToolCallStatus::Success, ..
+        }),
+        "ToolCall in earlier message should be updated to Success"
+    );
+}
+
+/// Full sequence: text → tool → text produces the right message structure.
+#[test]
+fn full_sequence_text_tool_text_structure() {
+    let mut h = TestHarness::new(100, 40);
+    h.type_str("fix bug");
+    h.press_enter();
+    h.app.state.agent_status = AgentStatus::Streaming;
+
+    let base = h.app.state.messages.len();
+
+    h.feed_agent_events(vec![
+        Event::AgentTextDelta("Let me look.\n".to_string()),
+        Event::AgentToolStart { name: "Read".to_string(), tool_use_id: "t1".to_string() },
+        Event::AgentToolCall { name: "Read".to_string(), input: serde_json::json!({"file_path": "main.rs"}), tool_use_id: "t1".to_string() },
+        Event::AgentToolResult { status: "success".to_string(), content: String::new(), tool_use_id: "t1".to_string() },
+        Event::AgentTextDelta("Found the issue.\n".to_string()),
+        Event::AgentDone,
+    ]);
+
+    // Text delta + ToolCall + post-tool text delta = 2 extra messages beyond base
+    assert_eq!(
+        h.app.state.messages.len(),
+        base + 2,
+        "Should have base + ToolCall message + post-tool text message"
+    );
+
+    let buf = h.render();
+    assert!(buffer_contains(&buf, "Let me look"), "Pre-tool text should render");
+    assert!(buffer_contains(&buf, "Found the issue"), "Post-tool text should render");
 }
 
 #[test]
@@ -3395,12 +3578,7 @@ fn resume_double_write_corrupts_journal() {
 fn simulate_resume(h: &mut TestHarness, sdk_messages: Vec<strands::types::content::Message>) {
     h.app.state.messages.clear();
     h.app.state.clear_render_caches();
-    for msg in &sdk_messages {
-        let chat_msg = super::app::ChatMessage::from_sdk_message(msg);
-        if !chat_msg.blocks.is_empty() {
-            h.app.state.messages.push(chat_msg);
-        }
-    }
+    h.app.state.messages = super::app::rebuild_display_messages(&sdk_messages);
     h.app.state.turn_count = h.app.state.messages.iter()
         .filter(|m| matches!(m.role, super::app::Role::User))
         .count();
@@ -3866,6 +4044,240 @@ fn resume_full_flow_no_duplicates() {
         last.text_content().contains("Resumed session"),
         "Last assistant message should contain resume notice"
     );
+}
+
+// ===========================================================================
+// rebuild_display_messages: tool_use / tool_result pairing (Unit 5)
+// ===========================================================================
+
+/// Core reordering test: each ToolUse is immediately paired with its ToolResult
+/// in the same ChatMessage. User messages with only ToolResult content are skipped.
+#[test]
+fn rebuild_display_messages_pairs_tool_use_with_result() {
+    use strands::types::content::{ContentBlock, Message, Role};
+    use strands::types::tools::{ToolResult, ToolResultContent, ToolResultStatus};
+
+    // SDK message layout:
+    //   [User]      "Fix the bug in main.rs"
+    //   [Assistant] Text("Let me look...") + ToolUse("Read", id="t1") + ToolUse("Grep", id="t2")
+    //   [User]      ToolResult(id="t1") + ToolResult(id="t2")
+    //   [Assistant] Text("I found the issue")
+    let sdk_messages = vec![
+        Message::new(
+            Role::User,
+            vec![ContentBlock::text("Fix the bug in main.rs")],
+        ),
+        Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::text("Let me look at the file."),
+                ContentBlock::tool_use_from_parts(
+                    "t1",
+                    "Read",
+                    serde_json::json!({"file_path": "main.rs"}),
+                ),
+                ContentBlock::tool_use_from_parts(
+                    "t2",
+                    "Grep",
+                    serde_json::json!({"pattern": "bug", "path": "."}),
+                ),
+            ],
+        ),
+        Message::new(
+            Role::User,
+            vec![
+                ContentBlock::tool_result(ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: vec![ToolResultContent {
+                        text: Some("file contents here".to_string()),
+                        document: None,
+                        image: None,
+                        json: None,
+                    }],
+                    status: ToolResultStatus::Success,
+                }),
+                ContentBlock::tool_result(ToolResult {
+                    tool_use_id: "t2".to_string(),
+                    content: vec![ToolResultContent {
+                        text: Some("match found on line 42".to_string()),
+                        document: None,
+                        image: None,
+                        json: None,
+                    }],
+                    status: ToolResultStatus::Success,
+                }),
+            ],
+        ),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::text("I found the issue.")],
+        ),
+    ];
+
+    let msgs = super::app::rebuild_display_messages(&sdk_messages);
+
+    // Expected ChatMessages (in order):
+    //   0: User       "Fix the bug in main.rs"
+    //   1: Assistant  Text("Let me look at the file.")
+    //   2: Assistant  ToolCall("Read") + ToolResult(t1)
+    //   3: Assistant  ToolCall("Grep") + ToolResult(t2)
+    //   4: Assistant  Text("I found the issue.")
+    assert_eq!(
+        msgs.len(),
+        5,
+        "Expected 5 ChatMessages, got {}. Messages: {:?}",
+        msgs.len(),
+        msgs.iter()
+            .map(|m| format!("{:?}: {} blocks", m.role, m.blocks.len()))
+            .collect::<Vec<_>>()
+    );
+
+    // Message 0: user prompt
+    assert!(matches!(msgs[0].role, super::app::Role::User));
+    assert_eq!(msgs[0].text_content(), "Fix the bug in main.rs");
+
+    // Message 1: assistant text
+    assert!(matches!(msgs[1].role, super::app::Role::Assistant));
+    assert!(msgs[1].text_content().contains("Let me look"));
+
+    // Message 2: ToolCall for Read, immediately followed by its ToolResult
+    assert!(matches!(msgs[2].role, super::app::Role::Assistant));
+    assert_eq!(msgs[2].blocks.len(), 2);
+    assert!(matches!(
+        msgs[2].blocks[0],
+        super::app::ContentBlock::ToolCall { ref name, .. } if name == "Read"
+    ));
+    assert!(matches!(
+        msgs[2].blocks[1],
+        super::app::ContentBlock::ToolResult { ref tool_use_id, .. } if tool_use_id == "t1"
+    ));
+
+    // Message 3: ToolCall for Grep, immediately followed by its ToolResult
+    assert!(matches!(msgs[3].role, super::app::Role::Assistant));
+    assert_eq!(msgs[3].blocks.len(), 2);
+    assert!(matches!(
+        msgs[3].blocks[0],
+        super::app::ContentBlock::ToolCall { ref name, .. } if name == "Grep"
+    ));
+    assert!(matches!(
+        msgs[3].blocks[1],
+        super::app::ContentBlock::ToolResult { ref tool_use_id, .. } if tool_use_id == "t2"
+    ));
+
+    // Message 4: final assistant text
+    assert!(matches!(msgs[4].role, super::app::Role::Assistant));
+    assert!(msgs[4].text_content().contains("I found the issue"));
+}
+
+/// User messages with only ToolResult content must be skipped — they are already
+/// paired with their ToolUse ChatMessages.
+#[test]
+fn rebuild_display_messages_skips_tool_result_only_user_messages() {
+    use strands::types::content::{ContentBlock, Message, Role};
+    use strands::types::tools::{ToolResult, ToolResultContent, ToolResultStatus};
+
+    let sdk_messages = vec![
+        Message::new(Role::User, vec![ContentBlock::text("run a command")]),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::tool_use_from_parts(
+                "tu1",
+                "Bash",
+                serde_json::json!({"command": "ls -la"}),
+            )],
+        ),
+        // This user message has ONLY a ToolResult — should be skipped in output.
+        Message::new(
+            Role::User,
+            vec![ContentBlock::tool_result(ToolResult {
+                tool_use_id: "tu1".to_string(),
+                content: vec![ToolResultContent {
+                    text: Some("total 0\n-rw-r--r-- 1 user user 0 file.txt".to_string()),
+                    document: None,
+                    image: None,
+                    json: None,
+                }],
+                status: ToolResultStatus::Success,
+            })],
+        ),
+        Message::new(Role::Assistant, vec![ContentBlock::text("The directory is empty.")]),
+    ];
+
+    let msgs = super::app::rebuild_display_messages(&sdk_messages);
+
+    // No user message with ToolResult-only content should appear
+    let user_msgs: Vec<_> = msgs
+        .iter()
+        .filter(|m| matches!(m.role, super::app::Role::User))
+        .collect();
+    assert_eq!(
+        user_msgs.len(),
+        1,
+        "Only the 'run a command' user message should appear; got {}",
+        user_msgs.len()
+    );
+    assert_eq!(user_msgs[0].text_content(), "run a command");
+
+    // The ToolResult should be paired inside the ToolCall ChatMessage
+    let tool_msgs: Vec<_> = msgs
+        .iter()
+        .filter(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, super::app::ContentBlock::ToolCall { .. }))
+        })
+        .collect();
+    assert_eq!(tool_msgs.len(), 1);
+    assert_eq!(
+        tool_msgs[0].blocks.len(),
+        2,
+        "ToolCall ChatMessage should have ToolCall + ToolResult blocks"
+    );
+}
+
+/// ToolUse blocks with no matching ToolResult are marked Success with no result block.
+#[test]
+fn rebuild_display_messages_tool_use_without_result() {
+    use strands::types::content::{ContentBlock, Message, Role};
+
+    // Assistant message with a ToolUse but no corresponding user ToolResult message.
+    let sdk_messages = vec![
+        Message::new(Role::User, vec![ContentBlock::text("check something")]),
+        Message::new(
+            Role::Assistant,
+            vec![ContentBlock::tool_use_from_parts(
+                "t99",
+                "Think",
+                serde_json::json!({"thought": "Analyzing..."}),
+            )],
+        ),
+        // No ToolResult user message — simulates incomplete session
+    ];
+
+    let msgs = super::app::rebuild_display_messages(&sdk_messages);
+
+    // Should have: user msg + tool call msg (with Success status, no ToolResult block)
+    let tool_msg = msgs
+        .iter()
+        .find(|m| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, super::app::ContentBlock::ToolCall { .. }))
+        })
+        .expect("Should have a ToolCall ChatMessage");
+
+    assert_eq!(
+        tool_msg.blocks.len(),
+        1,
+        "ToolCall without result should have only 1 block (the ToolCall itself)"
+    );
+    assert!(matches!(
+        tool_msg.blocks[0],
+        super::app::ContentBlock::ToolCall {
+            status: super::app::ToolCallStatus::Success,
+            ..
+        }
+    ));
 }
 
 // ===========================================================================

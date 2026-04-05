@@ -20,9 +20,10 @@ pub enum Event {
 
     // Agent stream events
     AgentTextDelta(String),
-    AgentToolStart { name: String },
-    AgentToolCall { name: String, input: serde_json::Value },
-    AgentToolResult { status: String, content: String },
+    AgentReasoningDelta(String),
+    AgentToolStart { name: String, tool_use_id: String },
+    AgentToolCall { name: String, input: serde_json::Value, tool_use_id: String },
+    AgentToolResult { status: String, content: String, tool_use_id: String },
     AgentDone,
     AgentError(String),
     /// EnterPlanMode tool succeeded — show inline suggestions for user to confirm/reject.
